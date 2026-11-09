@@ -1,0 +1,34 @@
+{
+  "name": "scrypted-ai-vision-alerts",
+  "version": "0.1.0",
+  "description": "Analyzes camera live-stream frames on motion with a vision AI model (Claude, Gemini, Ollama or any OpenAI-compatible server) and sends smart alerts.",
+  "main": "out/main.nodejs.js",
+  "scripts": {
+    "scrypted-setup-project": "node ./node_modules/@scrypted/sdk/dist/src/bin/scrypted-setup-project.js",
+    "prescrypted-setup-project": "node ./node_modules/@scrypted/sdk/dist/src/bin/scrypted-package-json.js",
+    "build": "node -e \"const cp=require('child_process'),s=cp.spawn;cp.spawn=(c,a,o)=>s(c,a,String(c).endsWith('.cmd')?{...o,shell:true}:o);require('./node_modules/@scrypted/sdk/dist/src/bin/scrypted-webpack.js')\"",
+    "prepublishOnly": "node -e \"process.env.NODE_ENV='production';const cp=require('child_process'),s=cp.spawn;cp.spawn=(c,a,o)=>s(c,a,String(c).endsWith('.cmd')?{...o,shell:true}:o);require('./node_modules/@scrypted/sdk/dist/src/bin/scrypted-webpack.js')\"",
+    "prescrypted-vscode-launch": "npm run build",
+    "scrypted-vscode-launch": "node ./node_modules/@scrypted/sdk/dist/src/bin/scrypted-deploy-debug.js",
+    "scrypted-deploy-debug": "node ./node_modules/@scrypted/sdk/dist/src/bin/scrypted-deploy-debug.js",
+    "scrypted-debug": "node ./node_modules/@scrypted/sdk/dist/src/bin/scrypted-debug.js",
+    "scrypted-deploy": "node ./node_modules/@scrypted/sdk/dist/src/bin/scrypted-deploy.js",
+    "scrypted-package-json": "node ./node_modules/@scrypted/sdk/dist/src/bin/scrypted-package-json.js"
+  },
+  "scrypted": {
+    "rollup": true,
+    "name": "AI Vision Alerts",
+    "type": "API",
+    "interfaces": [
+      "MixinProvider",
+      "Settings"
+    ]
+  },
+  "dependencies": {
+    "@scrypted/sdk": "^0.5.29"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "typescript": "^5.8.2"
+  }
+}
