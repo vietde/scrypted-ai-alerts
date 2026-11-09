@@ -1,0 +1,35 @@
+{
+  "name": "scrypted-ai-vision-alerts",
+  "version": "0.1.0",
+  "description": "Analyzes camera live-stream frames on motion with a vision AI model (Claude, Gemini, Ollama or any OpenAI-compatible server) and sends smart alerts.",
+  "main": "out/main.nodejs.js",
+  "scripts": {
+    "scrypted-setup-project": "node -e \"require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-setup-project.js'))\"",
+    "prescrypted-setup-project": "node -e \"require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-package-json.js'))\"",
+    "build": "node -e \"const cp=require('child_process'),p=require('path'),s=cp.spawn;cp.spawn=(c,a=[],o)=>String(c).includes('rollup')?s(process.execPath,[p.join(p.dirname(require.resolve('rollup/package.json')),'dist/bin/rollup'),...a],o):s(c,a,o);require(p.join(p.dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-webpack.js'))\"",
+    "prepublishOnly": "node -e \"process.env.NODE_ENV='production';const cp=require('child_process'),p=require('path'),s=cp.spawn;cp.spawn=(c,a=[],o)=>String(c).includes('rollup')?s(process.execPath,[p.join(p.dirname(require.resolve('rollup/package.json')),'dist/bin/rollup'),...a],o):s(c,a,o);require(p.join(p.dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-webpack.js'))\"",
+    "prescrypted-vscode-launch": "npm run build",
+    "scrypted-vscode-launch": "node -e \"process.argv.splice(1,0,'scrypted');require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-deploy-debug.js'))\"",
+    "scrypted-deploy-debug": "node -e \"process.argv.splice(1,0,'scrypted');require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-deploy-debug.js'))\"",
+    "scrypted-debug": "node -e \"process.argv.splice(1,0,'scrypted');require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-debug.js'))\"",
+    "scrypted-deploy": "node -e \"process.argv.splice(1,0,'scrypted');require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-deploy.js'))\"",
+    "scrypted-changelog": "node -e \"require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-changelog.js'))\"",
+    "scrypted-package-json": "node -e \"require(require('path').join(require('path').dirname(require.resolve('@scrypted/sdk')),'bin/scrypted-package-json.js'))\""
+  },
+  "scrypted": {
+    "rollup": true,
+    "name": "AI Vision Alerts",
+    "type": "API",
+    "interfaces": [
+      "MixinProvider",
+      "Settings"
+    ]
+  },
+  "dependencies": {
+    "@scrypted/sdk": "^0.5.29"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "typescript": "^5.8.2"
+  }
+}
