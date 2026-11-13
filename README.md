@@ -1,14 +1,21 @@
 # AI Vision Alerts for Scrypted
 
+<<<<<<< HEAD
 When a camera reports smart object/face detection or motion, this plugin samples
 frames from the camera's live stream, asks a vision AI model whether it is worth
 alerting about, verifies faces with strict quality gates and multi-frame
 confirmation, and sends a notification with a one-line description and a frame.
+=======
+When a camera reports motion, this plugin samples a few frames from the
+camera's live stream, asks a vision AI model whether it is worth alerting
+about, and sends a notification with a one-line description and a frame.
+>>>>>>> 0965ecfe64d95657973964a35a87badca93cb049
 It is a single TypeScript file (`src/main.ts`) and needs no other Scrypted
 plugins.
 
 ## How it works
 
+<<<<<<< HEAD
 1. The camera's Scrypted smart `ObjectDetector` (or motion sensor if the camera
    has no smart detector) fires. Low-confidence and tiny bounding-box triggers
    are ignored automatically.
@@ -81,6 +88,22 @@ recognitions**:
 | Brief reflections or passing glances still confirm | Confirmation frame count is too low for a busy walkway | Raise **Confirmation frames for stranger (within 30s)** from `3` to `4` (or **Confirmation frames for known person** from `2` to `3`) |
 | Same person triggers another alert too soon | Cooldown is shorter than how long they stay out front | Raise **Known person cooldown (minutes)** (default `2`) or **Stranger cooldown (minutes)** (default `15`) |
 | You don't want arrival alerts for yourself or family members | Enrolled names not in the mute list send `"<Name> arrived"` alerts | Add their names (e.g. `Alex, Sam`) or `family` to **Never notify for these names** |
+=======
+1. The camera's own motion sensor fires (ONVIF, Reolink, Hikvision, UniFi,
+   etc.).
+2. After a per-camera cooldown, the plugin pulls the live stream with
+   Scrypted's built-in ffmpeg and saves a few frames (default: 3 frames,
+   2 seconds apart).
+3. The frames go to your chosen AI provider, which replies with
+   `{alert, severity, summary, save}`.
+4. If `alert` is true and severity meets your minimum, the plugin notifies the
+   channels you picked (and optionally Scrypted notifier devices).
+
+If live stream sampling fails and the camera supports snapshots, it falls back
+to one snapshot. The AI sees sampled frames, not continuous video, so alert
+latency is roughly (frames - 1) x interval seconds plus the model's response
+time.
+>>>>>>> 0965ecfe64d95657973964a35a87badca93cb049
 
 ## AI providers
 
@@ -140,8 +163,12 @@ your other Scrypted notifiers.
 
 ## Requirements
 
+<<<<<<< HEAD
 - A camera with video streaming and either a smart `ObjectDetector` or a motion
   sensor in Scrypted.
+=======
+- A camera with both video streaming and a motion sensor in Scrypted.
+>>>>>>> 0965ecfe64d95657973964a35a87badca93cb049
 - At least one AI provider and one notification channel configured.
 
 ## Develop and deploy (VS Code)
@@ -166,6 +193,7 @@ When Scrypted runs as a Home Assistant OS add-on, its HTTPS port (usually
 
 1. Open **AI Vision Alerts** in Scrypted, choose a provider, fill in its
    section, and press **Test provider connection** (check the plugin console).
+<<<<<<< HEAD
 2. Under **Face & Object Recognition**, set `/media/faces` (or your reference
    list), add any muted names to **Never notify for these names**, and press
    **Load & verify enrolled faces**.
@@ -175,3 +203,10 @@ When Scrypted runs as a Home Assistant OS add-on, its HTTPS port (usually
    **Enable AI alerts**, and edit the rules.
 5. Press **Analyze now (test)** and check **Recent recognitions** on the plugin
    page to see real similarity scores.
+=======
+2. Set up at least one notification channel and press **Send test
+   notification**.
+3. Open a camera, go to the **AI Vision Alerts** group in its settings, turn on
+   **Enable AI alerts**, and edit the rules.
+4. Press **Analyze now (test)** to confirm the whole path works.
+>>>>>>> 0965ecfe64d95657973964a35a87badca93cb049
