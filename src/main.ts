@@ -59,6 +59,22 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { baseUrl: string; model: string }> 
     custom: { baseUrl: '', model: '' },
 };
 
+/** Returns true if the provider is local Ollama or points to a local/LAN server (never subject to daily quota limits). */
+function isLocalProvider(cfg: ProviderConfig): boolean {
+    if (cfg.provider === 'ollama')
+        return true;
+    const url = (cfg.baseUrl ?? '').trim().toLowerCase();
+    if (!url)
+        return false;
+    return (
+        url.includes('localhost') ||
+        url.includes('127.0.0.1') ||
+        url.includes(':11434') ||
+        url.includes('.local') ||
+        /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(url)
+    );
+}
+
 /** Returns a message if the provider is missing required settings, otherwise undefined. */
 function validateConfig(cfg: ProviderConfig): string | undefined {
     switch (cfg.provider) {
@@ -558,9 +574,17 @@ async function callModel(cfg: ProviderConfig, req: ModelRequest): Promise<string
             const headers: Record<string, string> = {};
             if (cfg.apiKey)
                 headers.authorization = `Bearer ${cfg.apiKey}`;
+            // Stitch multi-frame / reference+target images into a single JPEG for all Ollama vision models
+            // (llava, llama3.2-vision, qwen2.5vl, gemma3, minicpm-v, etc.) to avoid multi-image context/token limits.
+            let ollamaImages = b64s;
+            if (req.jpegs.length > 1) {
+                const stitched = await stitchJpegsHorizontal(req.jpegs);
+                if (stitched)
+                    ollamaImages = [stitched.toString('base64')];
+            }
             const user: any = { role: 'user', content: req.prompt };
-            if (b64s.length)
-                user.images = b64s;
+            if (ollamaImages.length)
+                user.images = ollamaImages;
             const json = await postJson(
                 `${base}/api/chat`,
                 headers,
@@ -569,7 +593,11 @@ async function callModel(cfg: ProviderConfig, req: ModelRequest): Promise<string
                     stream: false,
                     format: 'json',
                     messages: [{ role: 'system', content: req.system }, user],
-                    options: { num_predict: req.maxTokens },
+                    options: {
+                        num_predict: Math.max(req.maxTokens, 1024),
+                        num_ctx: 8192,
+                        temperature: 0.1,
+                    },
                 },
                 req.timeoutMs,
             );
@@ -669,6 +697,19 @@ function parseStage1(
         Number.isFinite(rawBest) && rawBest >= 1 && rawBest <= frameCount
             ? Math.round(rawBest) - 1
             : Math.floor(frameCount / 2);
+
+    // Fallback for vision models like llava that report a person/face without returning bounding box coordinates
+    if (aiFaces.length === 0 && (objects.includes('person') || objects.includes('face') || parsed.sharp === true)) {
+        const [imgW, imgH] = getJpegDimensions(cameraJpegs[bestFrameIndex] ?? cameraJpegs[0]);
+        aiFaces.push({
+            frameIndex: bestFrameIndex,
+            box: [0.25, 0.08, 0.5, 0.55],
+            widthPx: Math.round(imgW * 0.25),
+            heightPx: Math.round(imgH * 0.35),
+            sharp: parsed.sharp !== false,
+            sharpnessScore: 20,
+        });
+    }
 
     return {
         alert: parsed.alert === true || parsed.alert === 'true',
@@ -814,6 +855,64 @@ function personNameFromFilename(file: string): string {
         .replace(/[_\-\s]+\d+$/, '')
         .replace(/[_]+/g, ' ')
         .trim();
+}
+
+/**
+ * Stitches multiple JPEGs side-by-side into a single composite JPEG using Scrypted's ffmpeg.
+ * Used for Ollama models like `llava` that only support a single image per request and to minimize vision tokens.
+ */
+async function stitchJpegsHorizontal(jpegs: Buffer[]): Promise<Buffer | undefined> {
+    if (jpegs.length <= 1)
+        return jpegs[0];
+    try {
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ai-stitch-'));
+        try {
+            const inputArgs: string[] = [];
+            for (let i = 0; i < jpegs.length; i++) {
+                const p = path.join(dir, `in_${i}.jpg`);
+                await fs.writeFile(p, jpegs[i]);
+                inputArgs.push('-i', p);
+            }
+            const n = jpegs.length;
+            const scaleParts = jpegs.map((_, i) => `[${i}:v]scale=-2:384[v${i}]`).join(';');
+            const stackInputs = jpegs.map((_, i) => `[v${i}]`).join('');
+            const filterComplex = `${scaleParts};${stackInputs}hstack=inputs=${n}[out]`;
+            const outFile = path.join(dir, 'stitched.jpg');
+
+            await new Promise<void>((resolve, reject) => {
+                const proc = spawn(
+                    ffmpegPath,
+                    [
+                        '-nostdin',
+                        '-hide_banner',
+                        '-loglevel', 'error',
+                        ...inputArgs,
+                        '-filter_complex', filterComplex,
+                        '-map', '[out]',
+                        '-frames:v', '1',
+                        '-q:v', '5',
+                        outFile,
+                    ],
+                    { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true },
+                );
+                const timer = setTimeout(() => proc.kill('SIGKILL'), 10000);
+                proc.on('error', e => {
+                    clearTimeout(timer);
+                    reject(e);
+                });
+                proc.on('close', () => {
+                    clearTimeout(timer);
+                    resolve();
+                });
+            });
+            return await fs.readFile(outFile);
+        } finally {
+            await fs.rm(dir, { recursive: true, force: true });
+        }
+    } catch {
+        return undefined;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1287,10 +1386,17 @@ class AIAlertsMixin
         }
     }
 
-    /** Calls the first working provider in the chain. */
+    /** Calls the first working provider in the chain, enforcing daily quota only on paid cloud providers. */
     async runWithProviderChain(chain: ProviderConfig[], request: ModelRequest): Promise<{ text: string; used: ProviderId }> {
         let lastError: unknown;
         for (const cfg of chain) {
+            if (!isLocalProvider(cfg) && !this.provider.tryConsumeQuota(cfg)) {
+                lastError = new Error(
+                    `${cfg.provider}: Daily cloud AI call limit reached (raise or set Daily AI call limit to 0 for unlimited).`,
+                );
+                this.console.warn(errMsg(lastError));
+                continue;
+            }
             try {
                 const text = await callModel(cfg, request);
                 return { text, used: cfg.provider };
@@ -1390,7 +1496,7 @@ class AIAlertsMixin
             .filter(c => c.widthPx >= minKnownWidth)
             .sort((a, b) => (Number(b.sharp) - Number(a.sharp)) || (b.widthPx - a.widthPx));
 
-        if (viableForAi.length > 0 && faceRefs.length > 0 && this.provider.tryConsumeQuota()) {
+        if (viableForAi.length > 0 && faceRefs.length > 0) {
             try {
                 const bestCand = viableForAi[0];
                 const bestJpeg = cameraJpegs[bestCand.frameIndex] ?? cameraJpegs[0];
@@ -1629,11 +1735,6 @@ class AIAlertsMixin
             this.console.warn(`Skipping provider - ${p}`);
         if (!chain.length) {
             this.console.error('No usable AI provider. Fill in the provider settings on the AI Vision Alerts plugin page.');
-            return;
-        }
-
-        if (!this.provider.tryConsumeQuota()) {
-            this.console.warn('Daily AI call limit reached, skipping analysis.');
             return;
         }
 
@@ -2071,10 +2172,22 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         },
         dailyLimit: {
             group: 'AI provider',
-            title: 'Daily AI call limit (all cameras)',
-            description: 'Safety cap so a noisy camera cannot run up a bill or keep your GPU busy.',
+            title: 'Daily AI call limit (cloud providers only, 0 = unlimited)',
+            description:
+                'Optional safety cap for paid cloud providers. Local Ollama and LAN endpoints are ALWAYS unlimited and ignore this setting. Set to 0 for unlimited.',
             type: 'number',
-            defaultValue: 200,
+            defaultValue: 0,
+        },
+        resetDailyQuota: {
+            group: 'AI provider',
+            title: 'Reset daily call counter',
+            description: 'Resets today\'s cloud API call counter to 0 without restarting Scrypted.',
+            type: 'button',
+            onPut: async () => {
+                this.callsToday = 0;
+                this.callsDay = new Date().toDateString();
+                this.console.log('Daily AI call counter reset to 0.');
+            },
         },
         testProvider: {
             group: 'AI provider',
@@ -2293,8 +2406,8 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         ollamaModel: {
             group: 'Ollama (local)',
             title: 'Model (optional)',
-            description: 'Must support images, e.g. llama3.2-vision, qwen2.5vl, gemma3. Blank uses llama3.2-vision.',
-            placeholder: 'llama3.2-vision',
+            description: 'Must support images, e.g. llava, llama3.2-vision, qwen2.5vl, gemma3. Blank uses llava.',
+            placeholder: 'llava',
         },
         ollamaKey: {
             group: 'Ollama (local)',
@@ -2701,13 +2814,20 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         return Math.max(5, Number(this.storageSettings.values.timeoutSeconds ?? 60)) * 1000;
     }
 
-    tryConsumeQuota(): boolean {
+    tryConsumeQuota(cfg?: ProviderConfig): boolean {
+        const targetCfg = cfg ?? this.getConfigFor(providerId(this.storageSettings.values.aiProvider));
+        // Local Ollama (any model) and local LAN endpoints have no cloud billing quota—never block them
+        if (isLocalProvider(targetCfg))
+            return true;
+        const limit = Number(this.storageSettings.values.dailyLimit ?? 0);
+        if (limit <= 0)
+            return true; // 0 = unlimited
         const today = new Date().toDateString();
         if (today !== this.callsDay) {
             this.callsDay = today;
             this.callsToday = 0;
         }
-        if (this.callsToday >= Number(this.storageSettings.values.dailyLimit ?? 200))
+        if (this.callsToday >= limit)
             return false;
         this.callsToday++;
         return true;

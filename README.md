@@ -116,7 +116,7 @@ retyping keys.
 | Anthropic (Claude) | API key | `claude-haiku-4-5` |
 | OpenAI | API key | `gpt-4o-mini` |
 | Google Gemini | API key | `gemini-2.5-flash` |
-| Ollama (local) | Ollama URL (e.g. `http://192.168.100.20:11434`), model | `llama3.2-vision` |
+| Ollama (local) | Ollama URL (e.g. `http://192.168.100.20:11434`), model | `llama3.2-vision` (or `llava`, `qwen2.5vl`, `gemma3`) |
 | Custom endpoint (OpenAI-compatible) | Base URL (with `/v1`), model, optional key | none (required) |
 
 The custom endpoint covers LM Studio, vLLM, LiteLLM, OpenRouter, Azure-style
