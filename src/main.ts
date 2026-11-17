@@ -110,6 +110,8 @@ interface ModelRequest {
     jpegs: Buffer[];
     maxTokens: number;
     timeoutMs: number;
+    /** When true, enforces JSON output mode on providers like Gemini and Ollama (used for face similarity scoring). */
+    jsonMode?: boolean;
     /** When true on single-image Ollama models, stitches reference faces + target face into 1 strip. */
     stitchForSingleImageModel?: boolean;
 }
@@ -194,6 +196,91 @@ export interface FaceReference {
     isLearned?: boolean;
 }
 
+export interface KnownPlateEntry {
+    plate: string;
+    normalizedKey: string;
+    label: string;
+    isLearned?: boolean;
+    firstSeen?: string;
+}
+
+export interface EvaluatedPlate {
+    plate: string;
+    status: 'known' | 'learned' | 'new';
+    label: string; // e.g. "Tai's Red Tesla" or "Red Tesla (learned)"
+    vehicleDesc?: string;
+    confidence: number;
+    box?: [number, number, number, number];
+    savedPath?: string;
+}
+
+/** Normalizes a license plate string to uppercase alphanumeric only. */
+function cleanPlateString(raw: string): string {
+    return raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/** Maps OCR-confusable characters (0/O/Q/D, 1/I/L, 8/B, 5/S, 2/Z, 6/G) to a canonical skeleton for fuzzy plate matching. */
+function canonicalPlateSkeleton(plate: string): string {
+    return cleanPlateString(plate)
+        .replace(/[OQD]/g, '0')
+        .replace(/[IL]/g, '1')
+        .replace(/B/g, '8')
+        .replace(/S/g, '5')
+        .replace(/Z/g, '2')
+        .replace(/G/g, '6');
+}
+
+/** Returns similarity 0..1 between two license plate strings, accounting for OCR-confusable characters. */
+function plateSimilarity(a: string, b: string): number {
+    const ca = cleanPlateString(a);
+    const cb = cleanPlateString(b);
+    if (!ca || !cb)
+        return 0;
+    if (ca === cb)
+        return 1.0;
+    const sa = canonicalPlateSkeleton(ca);
+    const sb = canonicalPlateSkeleton(cb);
+    if (sa === sb)
+        return 0.96;
+    if (Math.abs(sa.length - sb.length) > 1)
+        return 0;
+    // Levenshtein distance on canonical skeleton
+    const m = sa.length;
+    const n = sb.length;
+    const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            const cost = sa[i - 1] === sb[j - 1] ? 0 : 1;
+            dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+        }
+    }
+    const dist = dp[m][n];
+    const maxLen = Math.max(m, n);
+    return Math.max(0, 1 - dist / maxLen);
+}
+
+/** Returns true if a string looks like a real license plate number (3..8 chars, contains at least one digit, and is not a generic English word). */
+function isValidPlateCandidate(raw: string): boolean {
+    const cleaned = cleanPlateString(raw);
+    if (cleaned.length < 3 || cleaned.length > 8)
+        return false;
+    // Standard vehicle license plates almost always contain at least one digit (0-9).
+    // Requiring a digit prevents English words like "OFFOOD" (from "plate of food") or "PORCH" from being treated as license plates!
+    if (!/\d/.test(cleaned))
+        return false;
+    const blockedWords = new Set([
+        'NONE', 'UNKNOWN', 'NULL', 'VISIBLE', 'LICENSE', 'PLATE', 'TESLA', 'TOYOTA', 'HONDA', 'FORD',
+        'CHEVY', 'BMW', 'MERCEDES', 'AUDI', 'SUBARU', 'NISSAN', 'HYUNDAI', 'KIA', 'AMAZON', 'FEDEX',
+        'USPS', 'DHL', 'UPS', 'VEHICLE', 'SEDAN', 'TRUCK', 'SUV', 'VAN', 'CAR', 'BLURRY', 'UNREADABLE',
+        'NOTVISIBLE', 'NA', 'YES', 'TRUE', 'FALSE', 'OFFOOD',
+    ]);
+    if (blockedWords.has(cleaned))
+        return false;
+    return true;
+}
+
 export interface DetectedFaceCandidate {
     frameIndex: number;
     /** Normalized bounding box [x, y, width, height] in 0..1 */
@@ -240,6 +327,7 @@ interface Verdict {
     unknownFacesCount: number;
     evaluatedFaces: EvaluatedFace[];
     licensePlates: string[];
+    evaluatedPlates: EvaluatedPlate[];
     vehicles: string[];
     deliveryCarrier?: string;
     carriedItems: string[];
@@ -697,8 +785,8 @@ async function computeFrameChange(
 
     const changedPercent = Math.round((changedCount / total) * 1000) / 10;
     const isScatteredWeatherNoise =
-        changedCount > 0 && largestClusterBlocks < 4 && smallSpeckleBlocks / changedCount >= 0.6;
-    const hasMeaningfulChange = largestClusterBlocks >= 3 && changedPercent >= 0.8 && !isScatteredWeatherNoise;
+        changedCount > 0 && largestClusterBlocks < 5 && smallSpeckleBlocks / changedCount >= 0.55;
+    const hasMeaningfulChange = largestClusterBlocks >= 5 && changedPercent >= 1.8 && !isScatteredWeatherNoise;
     return {
         changedPercent,
         largestClusterBlocks,
@@ -707,19 +795,30 @@ async function computeFrameChange(
     };
 }
 
-const DEFAULT_SYSTEM_PROMPT =
-    'You are an expert home security camera vision analyst. ' +
-    'You receive camera frame(s) sampled when motion or activity was detected. ' +
-    'Analyze the frames carefully for all of the following:\n' +
-    '1. PEOPLE, MOVEMENTS & FACES: Detect any person/human, what they are doing (walking, standing, approaching door, delivering, carrying items), and locate any visible faces in "detectedFaces".\n' +
-    '2. FRAME-TO-FRAME & BASELINE CHANGES: Compare the frames (and previous baseline description if provided) for any obvious changes: a car pulling in or leaving, a vehicle replaced by a different vehicle (e.g. a black car replaced by a red car), an idle object (chair, bicycle, trash can, package) that suddenly moved or disappeared, or a person/animal suddenly appearing. Alert on any such change.\n' +
-    '3. WEATHER & IDLE FILTER: Do NOT alert ("alert": false) if NO person/animal/change is present and the motion is only rain, wind, falling leaves, swaying trees/bushes, shadows, or an unchanged parked car/chair sitting in the exact same spot.\n' +
-    '4. LICENSE PLATES & VEHICLES: Read any visible vehicle license plate characters in "licensePlates" (e.g. ["ABC-1234"]) and describe vehicles in "vehicles" (e.g. ["red SUV"]).\n' +
-    '5. COURIERS & PACKAGES vs. PERSONAL ITEMS: Identify delivery couriers by uniform, logo, or van ("Amazon", "FedEx", "UPS", "USPS", "DHL") in "deliveryCarrier". Distinguish actual delivery packages ("package" in "objects") from people carrying personal/household items such as handbags, purses, backpacks, trash bags, or groceries (list those in "carriedItems", e.g. ["backpack", "trash"], and do NOT label a handbag/backpack/trash bag as a package delivery).\n' +
-    'Reply with ONLY a valid JSON object, no markdown:\n' +
-    '{"alert": boolean, "sceneChanged": boolean, "severity": "low" | "medium" | "high", "summary": string, "save": "none" | "snapshot" | "clip" | "both", ' +
-    '"objects": string[], "licensePlates": string[], "vehicles": string[], "deliveryCarrier": string, "carriedItems": string[], ' +
-    '"detectedFaces": [{"frame": number, "box": [number, number, number, number], "sharp": boolean}], "bestFrame": number}.';
+const LEGACY_BUILT_IN_PROMPTS = [
+    'SYSTEM INSTRUCTION: You are a highly strict security analysis AI.',
+    'Alert on any person near a door, window or garage, anyone carrying or taking a package, or anyone behaving suspiciously.',
+    'Alert on any person, animal, package delivery, moving or changed vehicle, or any obvious change in the scene.',
+];
+
+function getCleanUserPrompt(rules?: string): string {
+    const trimmed = (rules ?? '').trim();
+    if (!trimmed)
+        return '';
+    for (const legacyPrefix of LEGACY_BUILT_IN_PROMPTS) {
+        if (trimmed.startsWith(legacyPrefix))
+            return '';
+    }
+    return trimmed;
+}
+
+const PLATE_OCR_SYSTEM_PROMPT =
+    'You are a specialized Automatic License Plate Reader (ALPR / OCR). ' +
+    'Examine all vehicles in the image closely and read the exact alphanumeric characters on any visible license plate. ' +
+    'Only report a plate if you can actually read the letters/numbers on the plate (do not guess or invent characters). ' +
+    'Reply with ONLY a JSON object, no markdown: ' +
+    '{"plates": [{"plate": "exact uppercase characters", "vehicle": "color make/type", "box": [x, y, width, height], "confidence": 0.95}]}. ' +
+    'If no license plate characters are readable, reply with: {"plates": []}.';
 
 const FACE_SIMILARITY_SYSTEM_PROMPT =
     'You are a precise facial recognition scoring model. ' +
@@ -732,17 +831,11 @@ const FACE_SIMILARITY_SYSTEM_PROMPT =
     'Also set "sharp": true only if the target face in the last image has clear, non-blurry facial features. ' +
     'Reply with ONLY a JSON object, no markdown: {"scores": {"<Name>": number}, "sharp": boolean}.';
 
-const DEFAULT_RULES =
-    'Alert on any person, animal, package delivery, moving or changed vehicle, or any obvious change in the scene. ' +
-    'Do not alert on falling leaves, wind, rain, or unmoving background objects.';
-
-const DEFAULT_EVIDENCE_RULES =
-    'Save a clip when a person is near a door, window or garage or is carrying or taking something. ' +
-    'Save only a snapshot for other alerts. Save nothing for non-alerts.';
+const DEFAULT_EVIDENCE_RULES = '';
 
 function buildPrompt(
     cameraName: string,
-    rules: string,
+    userRules: string | undefined,
     frames: number,
     intervalSec: number,
     evidenceRules?: string,
@@ -750,7 +843,9 @@ function buildPrompt(
     diffInfo?: FrameDiffResult,
     previousSceneSummary?: string,
     hasBaselineImage = false,
-): string {
+): { system: string; prompt: string } {
+    const activePrompt = getCleanUserPrompt(userRules);
+
     let hintLine = '';
     if (detectorHint && (detectorHint.objects.length || detectorHint.faces.length)) {
         const parts: string[] = [];
@@ -763,36 +858,45 @@ function buildPrompt(
     }
 
     const prevLine = previousSceneSummary
-        ? `Previous scene state before this event: "${previousSceneSummary}". Compare the current view against this previous state (e.g. did a car arrive/leave, did a black car get replaced by a red car, did an idle chair/object move, or did a person appear?).\n`
+        ? `Previous event summary: "${previousSceneSummary}".\n`
         : '';
 
     const frameLine = hasBaselineImage
-        ? `Image #1 is the previous baseline frame; Image #2..#${frames} are the current live frame(s) (${intervalSec}s apart).\n`
-        : `${frames} live camera frame(s), about ${intervalSec}s apart.\n`;
+        ? `Image #1 is the previous baseline frame; Image #${frames} is the current live frame.\n`
+        : `${frames} current live camera frame(s), about ${intervalSec}s apart.\n`;
 
     let diffLine = '';
     if (diffInfo) {
         if (diffInfo.isScatteredWeatherNoise) {
             diffLine = `Pixel comparison with previous frame: only ${diffInfo.changedPercent}% scattered speckles changed (typical of falling leaves, wind, or rain).\n`;
         } else if (!diffInfo.hasMeaningfulChange) {
-            diffLine = `Pixel comparison with previous frame: scene is nearly identical (${diffInfo.changedPercent}% diff) — ignore stationary parked cars or chairs unless a person or new object is visible.\n`;
+            diffLine = `Pixel comparison with previous frame: scene is nearly identical (${diffInfo.changedPercent}% diff).\n`;
         } else {
-            diffLine = `Pixel comparison with previous frame: ${diffInfo.changedPercent}% of the frame changed (contiguous moving/changed cluster of ${diffInfo.largestClusterBlocks} blocks) — identify what person, vehicle, color change, or object moved or appeared!\n`;
+            diffLine = `Pixel comparison with previous frame: ${diffInfo.changedPercent}% of the frame changed (contiguous moving/changed cluster of ${diffInfo.largestClusterBlocks} blocks).\n`;
         }
     }
 
-    return (
+    // Only add a lightweight NO_ALERT instruction if the user's prompt does not already specify NO_ALERT, [ALERT_START], or JSON
+    const formatHint =
+        activePrompt && !/\[ALERT_START\]|NO_ALERT|\{/i.test(activePrompt)
+            ? '\nFollow the user rules above strictly. If your rules for an alert are NOT met, reply with exactly: "NO_ALERT". ' +
+              'If your rules ARE met, describe the alert clearly (including what the person is doing, their surroundings, any delivery/package, and any readable vehicle license plate).'
+            : !activePrompt
+                ? 'Describe any active human activity (including what the person is doing and their surroundings), delivery packages, or moving/arriving vehicles (including any readable license plate). If nothing notable is happening, reply with "NO_ALERT".'
+                : '';
+
+    const contextBlock =
         `Camera: ${cameraName}\n` +
-        `Trigger: ${detectorHint ? 'smart object detection' : 'motion detected'}\n` +
         frameLine +
         prevLine +
         diffLine +
         hintLine +
-        `Homeowner rules: ${rules}\n` +
-        (evidenceRules ? `Evidence rules (for the "save" field): ${evidenceRules}\n` : '') +
-        'Reply with ONLY a JSON object using these exact keys:\n' +
-        '{"alert": true, "sceneChanged": true, "severity": "low" | "medium" | "high", "summary": "short description of activity, courier/items, vehicle color/plate, or changes", "save": "none" | "snapshot" | "clip" | "both", "objects": ["person"], "licensePlates": [], "vehicles": [], "deliveryCarrier": "", "carriedItems": [], "detectedFaces": [{"frame": 1, "box": [0.25, 0.1, 0.2, 0.3], "sharp": true}], "bestFrame": 1}'
-    );
+        (evidenceRules ? `Evidence rules: ${evidenceRules}\n` : '');
+
+    return {
+        system: (activePrompt + formatHint).trim(),
+        prompt: contextBlock.trim(),
+    };
 }
 
 function buildFaceSimilarityPrompt(faceRefs: FaceReference[]): string {
@@ -850,13 +954,16 @@ async function callModel(cfg: ProviderConfig, req: ModelRequest): Promise<string
         case 'gemini': {
             const parts: any[] = b64s.map(data => ({ inline_data: { mime_type: 'image/jpeg', data } }));
             parts.push({ text: req.prompt });
+            const generationConfig: Record<string, unknown> = { maxOutputTokens: req.maxTokens };
+            if (req.jsonMode)
+                generationConfig.responseMimeType = 'application/json';
             const json = await postJson(
                 `${base}/models/${model}:generateContent`,
                 { 'x-goog-api-key': cfg.apiKey ?? '' },
                 {
                     systemInstruction: { parts: [{ text: req.system }] },
                     contents: [{ role: 'user', parts }],
-                    generationConfig: { maxOutputTokens: req.maxTokens, responseMimeType: 'application/json' },
+                    generationConfig,
                 },
                 req.timeoutMs,
             );
@@ -887,22 +994,19 @@ async function callModel(cfg: ProviderConfig, req: ModelRequest): Promise<string
             const user: any = { role: 'user', content: combinedPrompt };
             if (ollamaImages.length)
                 user.images = ollamaImages;
-            const json = await postJson(
-                `${base}/api/chat`,
-                headers,
-                {
-                    model,
-                    stream: false,
-                    format: 'json',
-                    messages: [{ role: 'system', content: req.system }, user],
-                    options: {
-                        num_predict: Math.max(req.maxTokens, 1024),
-                        num_ctx: 8192,
-                        temperature: 0.1,
-                    },
+            const body: Record<string, unknown> = {
+                model,
+                stream: false,
+                messages: [{ role: 'system', content: req.system }, user],
+                options: {
+                    num_predict: Math.max(req.maxTokens, 1024),
+                    num_ctx: 8192,
+                    temperature: 0.1,
                 },
-                req.timeoutMs,
-            );
+            };
+            if (req.jsonMode)
+                body.format = 'json';
+            const json = await postJson(`${base}/api/chat`, headers, body, req.timeoutMs);
             return json.message?.content ?? '';
         }
 
@@ -945,18 +1049,260 @@ interface Stage1Parsed {
     bestFrameIndex: number;
 }
 
-/** Pulls the Stage 1 JSON verdict, objects, license plates, couriers, and face bounding boxes out of any model's reply. */
+/**
+ * Parses Stage 1 model replies in ANY format:
+ * 1. The default [ALERT_START] ... [ALERT_END] block or "NO_ALERT" / "NO_ALERT_DUPLICATE"
+ * 2. A JSON object {...} (if the user's custom prompt or model uses JSON)
+ * 3. Free-form text (if the user's custom prompt uses plain text)
+ */
 function parseStage1(
     text: string,
     cameraJpegs: Buffer[],
     upstreamObjects: string[] = [],
     diffInfo?: FrameDiffResult,
 ): Stage1Parsed {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match)
-        throw new Error(`Model did not return JSON: ${text.slice(0, 200)}`);
-    const parsed = JSON.parse(match[0]);
+    const trimmed = text.trim();
     const frameCount = cameraJpegs.length;
+    const defaultBestIdx = Math.floor(frameCount / 2);
+
+    // 1. Check for explicit NO_ALERT or NO_ALERT_DUPLICATE when [ALERT_START] is not present
+    if (
+        !/\[ALERT_START\]/i.test(trimmed) &&
+        (/\bNO_ALERT_DUPLICATE\b/i.test(trimmed) || /\bNO_ALERT\b/i.test(trimmed))
+    ) {
+        const isDup = /\bNO_ALERT_DUPLICATE\b/i.test(trimmed);
+        return {
+            alert: false,
+            sceneChanged: false,
+            weatherOrIdleOnly: true,
+            severity: 'low',
+            summary: isDup ? 'NO_ALERT_DUPLICATE (duplicate activity ignored)' : 'NO_ALERT',
+            save: 'none',
+            objects: [],
+            licensePlates: [],
+            vehicles: [],
+            carriedItems: [],
+            aiFaces: [],
+            bestFrameIndex: defaultBestIdx,
+        };
+    }
+
+    // 2. Check for [ALERT_START] ... [ALERT_END] format (or structured Severity:/Event Type:/Description: lines)
+    const alertBlockMatch = trimmed.match(/\[ALERT_START\]([\s\S]*?)(?:\[ALERT_END\]|$)/i);
+    const hasStructuredFields = /^\s*(?:Severity|Event\s*Type|Description)\s*:/im.test(trimmed);
+    if (alertBlockMatch || hasStructuredFields) {
+        const block = (alertBlockMatch ? alertBlockMatch[1] : trimmed).trim();
+        const getField = (name: string): string => {
+            const m = block.match(new RegExp(`^\\s*${name}\\s*:\\s*(.+)$`, 'im'));
+            return m ? m[1].trim().replace(/^\[|\]$/g, '').trim() : '';
+        };
+
+        const sevRaw = getField('Severity').toLowerCase();
+        const eventType = getField('Event Type');
+        const description = getField('Description');
+        const surrounding = getField('Surrounding') || getField('Surroundings');
+        const subjects = getField('Subjects');
+        const vehicleField = getField('Vehicle');
+        const licensePlateField = getField('License Plate');
+        const faceBoxField = getField('Face Box');
+        const confidence = getField('Confidence');
+
+        let severity: 'low' | 'medium' | 'high' = 'medium';
+        if (sevRaw.includes('high') || /HIGH\s+SEVERITY/i.test(eventType))
+            severity = 'high';
+        else if (sevRaw.includes('low'))
+            severity = 'low';
+
+        const cleanField = (val: string) =>
+            /^(none|n\/a|not\s+applicable|unknown|null|-|no\s+(vehicle|car|person|people|subject|items?)\b.*)$/i.test(val.trim())
+                ? ''
+                : val.trim();
+
+        const descClean = cleanField(description);
+        const surrClean = cleanField(surrounding);
+        const subjClean = cleanField(subjects);
+        const vehClean = cleanField(vehicleField);
+        const evtClean = cleanField(eventType);
+        const confClean = cleanField(confidence);
+
+        const summaryParts: string[] = [];
+        if (evtClean)
+            summaryParts.push(`[${evtClean}]`);
+        if (descClean)
+            summaryParts.push(descClean);
+        if (surrClean)
+            summaryParts.push(`Surrounding: ${surrClean}`);
+        if (subjClean)
+            summaryParts.push(`Subjects: ${subjClean}`);
+        if (vehClean)
+            summaryParts.push(`Vehicle: ${vehClean}`);
+        if (confClean)
+            summaryParts.push(`(${confClean})`);
+
+        const combinedSummary = summaryParts.join(' ').trim() || block.replace(/\s+/g, ' ').slice(0, 240);
+        const lowerAll = `${evtClean} ${descClean} ${surrClean} ${subjClean} ${vehClean}`.toLowerCase();
+
+        // Extract license plates from License Plate field, Vehicle field, or Description
+        const licensePlates: string[] = [];
+        const plateClean = cleanField(licensePlateField);
+        if (plateClean && isValidPlateCandidate(plateClean)) {
+            licensePlates.push(cleanPlateString(plateClean));
+        }
+        const plateRegexMatch = `${plateClean} ${vehClean}`.match(
+            /\b(?:license\s+plate|plate\s*(?:number|#|is))\s*[:#]?\s*([A-Z0-9]{2,4}[-\s]?[A-Z0-9]{2,5})\b/i,
+        );
+        if (plateRegexMatch?.[1] && isValidPlateCandidate(plateRegexMatch[1])) {
+            const norm = cleanPlateString(plateRegexMatch[1]);
+            if (!licensePlates.includes(norm))
+                licensePlates.push(norm);
+        }
+
+        // Extract delivery carrier
+        let deliveryCarrier: string | undefined;
+        for (const c of DELIVERY_CARRIERS) {
+            if (new RegExp(`\\b${c}\\b`, 'i').test(lowerAll)) {
+                deliveryCarrier = c;
+                break;
+            }
+        }
+
+        // Extract carried personal items vs delivery packages
+        const carriedItems: string[] = [];
+        for (const item of ['handbag', 'purse', 'backpack', 'trash', 'trash bag', 'garbage', 'groceries', 'umbrella', 'briefcase']) {
+            if (new RegExp(`\\b${item}\\b`, 'i').test(lowerAll))
+                carriedItems.push(item);
+        }
+        const onlyPersonalItem =
+            carriedItems.length > 0 &&
+            !deliveryCarrier &&
+            !/\b(package|parcel|delivery\s+box|cardboard\s+box|amazon|fedex|ups|usps|dhl)\b/.test(lowerAll);
+
+        const rawObjects: string[] = [...upstreamObjects];
+        if (
+            /human|delivery|security|vehicle\s+arrival/i.test(evtClean) ||
+            subjClean ||
+            /\b(person|people|human|man|woman|individual|subject|driver|courier|walking|standing|exiting|loitering)\b/.test(lowerAll)
+        ) {
+            rawObjects.push('person');
+        }
+        if (/delivery/i.test(evtClean) || deliveryCarrier || (!onlyPersonalItem && /\b(package|parcel|box)\b/.test(lowerAll))) {
+            rawObjects.push('package');
+        }
+        if (
+            /vehicle/i.test(evtClean) ||
+            (vehClean && !/\bno\s+(vehicle|car|truck|van|suv)\b/i.test(vehClean)) ||
+            (!/\bno\s+(vehicle|car|truck|van|suv)\b/i.test(lowerAll) &&
+                /\b(car|truck|van|suv|vehicle|sedan|pickup)\b/.test(lowerAll))
+        ) {
+            rawObjects.push('vehicle');
+        }
+        if (/\b(dog|cat|animal|pet|deer|wildlife)\b/.test(lowerAll)) {
+            rawObjects.push('animal');
+        }
+
+        const objects = normalizeObjects(rawObjects, false);
+        const aiFaces: DetectedFaceCandidate[] = [];
+        // Only add an AI face candidate if an explicit Face Box [x, y, w, h] was provided or Subjects mentions a clear/close face
+        if (faceBoxField) {
+            const nums = faceBoxField.match(/[\d.]+/g)?.map(Number);
+            if (nums && nums.length === 4) {
+                const [imgW, imgH] = getJpegDimensions(cameraJpegs[defaultBestIdx] ?? cameraJpegs[0]);
+                const [bx, by, bw, bh] = nums;
+                const widthPx = Math.round(bw * imgW);
+                const heightPx = Math.round(bh * imgH);
+                if (widthPx >= 48 && heightPx >= 48) {
+                    aiFaces.push({
+                        frameIndex: defaultBestIdx,
+                        box: [bx, by, bw, bh],
+                        widthPx,
+                        heightPx,
+                        sharp: !/\b(blurry|obscured|hidden|unknown)\b/i.test(subjClean),
+                        sharpnessScore: 20,
+                    });
+                }
+            }
+        }
+
+        const save: SavePlan =
+            severity === 'high' || /delivery|security/i.test(evtClean) ? 'clip' : 'snapshot';
+
+        return {
+            alert: true,
+            sceneChanged: true,
+            weatherOrIdleOnly: false,
+            severity,
+            summary: combinedSummary,
+            save,
+            objects,
+            licensePlates,
+            vehicles: vehClean ? [vehClean] : [],
+            deliveryCarrier,
+            carriedItems,
+            aiFaces,
+            bestFrameIndex: defaultBestIdx,
+        };
+    }
+
+    // 3. Check for JSON object {...} (custom prompts or JSON-mode replies)
+    const match = trimmed.match(/\{[\s\S]*\}/);
+    if (!match) {
+        // 4. Plain-text fallback for custom user prompts
+        const lowerTrim = trimmed.toLowerCase();
+        const isNegative =
+            /^(no\b|none\b|false\b|nothing\b|empty\b|no\s+alert)/i.test(trimmed) ||
+            /\b(no\s+(person|people|human|vehicle|activity|movement|change|alert)|nothing\s+(notable|happening|detected|to\s+report)|empty\s+(porch|driveway|yard|scene))\b/i.test(
+                lowerTrim,
+            );
+        const rawObjects = [...upstreamObjects];
+        if (!isNegative) {
+            if (/\b(person|people|human|man|woman|someone|individual|visitor|courier)\b/i.test(lowerTrim))
+                rawObjects.push('person');
+            if (/\b(car|truck|van|suv|vehicle|sedan|tesla|pickup)\b/i.test(lowerTrim) && !/\bno\s+(vehicle|car)\b/i.test(lowerTrim))
+                rawObjects.push('vehicle');
+            if (/\b(package|parcel|delivery|amazon|fedex|ups|usps|dhl)\b/i.test(lowerTrim))
+                rawObjects.push('package');
+            if (/\b(dog|cat|animal|pet|deer|wildlife)\b/i.test(lowerTrim))
+                rawObjects.push('animal');
+        }
+        const licensePlates: string[] = [];
+        const plateMatchPlain = trimmed.match(
+            /\b(?:license\s+plate|plate\s*(?:number|#|is))\s*[:#]?\s*([A-Z0-9]{2,4}[-\s]?[A-Z0-9]{2,5})\b/i,
+        );
+        if (plateMatchPlain?.[1] && isValidPlateCandidate(plateMatchPlain[1]))
+            licensePlates.push(cleanPlateString(plateMatchPlain[1]));
+
+        let deliveryCarrier: string | undefined;
+        for (const c of DELIVERY_CARRIERS) {
+            if (new RegExp(`\\b${c}\\b`, 'i').test(lowerTrim)) {
+                deliveryCarrier = c;
+                break;
+            }
+        }
+        const carriedItems: string[] = [];
+        for (const item of ['handbag', 'purse', 'backpack', 'trash', 'trash bag', 'garbage', 'groceries', 'umbrella', 'briefcase']) {
+            if (new RegExp(`\\b${item}\\b`, 'i').test(lowerTrim))
+                carriedItems.push(item);
+        }
+
+        const objects = normalizeObjects(rawObjects, false);
+        return {
+            alert: !isNegative && trimmed.length > 0,
+            sceneChanged: !isNegative,
+            weatherOrIdleOnly: isNegative,
+            severity: 'medium',
+            summary: trimmed.replace(/\s+/g, ' ').slice(0, 320) || 'NO_ALERT',
+            save: 'snapshot',
+            objects,
+            licensePlates,
+            vehicles: [],
+            deliveryCarrier,
+            carriedItems,
+            aiFaces: [],
+            bestFrameIndex: defaultBestIdx,
+        };
+    }
+    const parsed = JSON.parse(match[0]);
+    const frameCountJson = cameraJpegs.length;
 
     const aiFaces: DetectedFaceCandidate[] = [];
     if (Array.isArray(parsed.detectedFaces)) {
@@ -1001,6 +1347,10 @@ function parseStage1(
     let rawSummary = String(
         parsed.summary ?? parsed.description ?? parsed.caption ?? parsed.message ?? parsed.reason ?? parsed.activity ?? parsed.scene ?? '',
     ).trim();
+    const jsonSurrounding = String(parsed.surrounding ?? parsed.surroundings ?? '').trim();
+    if (jsonSurrounding && !/^(none|n\/a|unknown|null|-)$/i.test(jsonSurrounding) && !rawSummary.includes(jsonSurrounding)) {
+        rawSummary = rawSummary ? `${rawSummary} Surrounding: ${jsonSurrounding}` : `Surrounding: ${jsonSurrounding}`;
+    }
     if (!rawSummary) {
         for (const [k, v] of Object.entries(parsed)) {
             if (typeof v === 'string' && v.trim().length > 6 && !['severity', 'save', 'confidence', 'deliveryCarrier'].includes(k)) {
@@ -1028,8 +1378,8 @@ function parseStage1(
     } else if (typeof parsed.licensePlate === 'string') {
         addPlate(parsed.licensePlate);
     }
-    const plateMatch = summary.match(/\b(?:license\s+plate|plate\s*(?:number|#|:)?)\s*([A-Z0-9]{2,4}[-\s]?[A-Z0-9]{2,5})\b/i);
-    if (plateMatch?.[1])
+    const plateMatch = summary.match(/\b(?:license\s+plate|plate\s*(?:number|#|is))\s*[:#]?\s*([A-Z0-9]{2,4}[-\s]?[A-Z0-9]{2,5})\b/i);
+    if (plateMatch?.[1] && isValidPlateCandidate(plateMatch[1]))
         addPlate(plateMatch[1]);
 
     // Parse vehicles descriptions
@@ -1544,10 +1894,22 @@ class AIAlertsMixin
             defaultValue: 30,
         },
         rules: {
-            title: 'What should trigger an alert?',
-            description: 'Plain-English rules the AI uses to decide.',
+            title: 'Alert prompt / rules',
+            description:
+                'Write your own prompt and rules for when to trigger an alert and what to include in the alert message.',
             type: 'textarea',
-            defaultValue: DEFAULT_RULES,
+            defaultValue: '',
+            placeholder:
+                'Write your own rules here (e.g. Alert when a person, delivery, or vehicle is on the property, and describe their activity and surroundings)...',
+        },
+        clearRules: {
+            title: 'Clear prompt',
+            description: 'Clears the alert prompt box above so you can write a fresh prompt.',
+            type: 'button',
+            onPut: async () => {
+                await this.storageSettings.putSetting('rules', '');
+                this.console.log('Cleared alert prompt.');
+            },
         },
         objectFilter: {
             title: 'Additional required object filter (optional)',
@@ -1638,6 +2000,12 @@ class AIAlertsMixin
     ) {
         super(options);
         this.provider = provider;
+
+        // If the camera still had an old built-in default prompt saved in storage, clear it so the user starts with a clean box
+        const currentRules = String(this.storageSettings.values.rules ?? '').trim();
+        if (currentRules && !getCleanUserPrompt(currentRules)) {
+            this.storageSettings.putSetting('rules', '').catch(() => {});
+        }
 
         const hasObjectDetector = this.mixinDeviceInterfaces.includes(ScryptedInterface.ObjectDetector);
 
@@ -1889,6 +2257,17 @@ class AIAlertsMixin
             }
         }
 
+        // Prefer instant camera snapshots via takePicture() when count === 1 or when RTSP/H.264 stream sampling
+        // fails on cameras that start mid-GOP without an IDR keyframe ("No start code is found").
+        if (count === 1 && !detectorFrame && this.mixinDevice.takePicture) {
+            try {
+                const picture = await this.mixinDevice.takePicture({ reason: 'event' });
+                return [await mediaManager.convertMediaObjectToBuffer(picture, 'image/jpeg')];
+            } catch {
+                // fall through to stream sampling
+            }
+        }
+
         try {
             let mo: MediaObject;
             try {
@@ -1912,9 +2291,10 @@ class AIAlertsMixin
         } catch (e) {
             if (detectorFrame)
                 return [detectorFrame];
-            this.console.warn('Live stream sampling failed, trying a snapshot instead:', e);
-            if (!this.mixinDevice.takePicture)
+            if (!this.mixinDevice.takePicture) {
+                this.console.warn('Live stream sampling failed and camera has no takePicture():', e);
                 throw e;
+            }
             const picture = await this.mixinDevice.takePicture!({ reason: 'event' });
             return [await mediaManager.convertMediaObjectToBuffer(picture, 'image/jpeg')];
         }
@@ -2036,6 +2416,7 @@ class AIAlertsMixin
                     jpegs: [...faceRefs.map(r => r.jpeg), bestJpeg],
                     maxTokens: 150,
                     timeoutMs: this.provider.timeoutMs(),
+                    jsonMode: true,
                     stitchForSingleImageModel: true,
                 };
                 const { text: simText } = await this.runWithProviderChain(chain, simReq);
@@ -2227,6 +2608,113 @@ class AIAlertsMixin
         return results;
     }
 
+    /**
+     * Reads license plates from the camera frame (using native high-res snapshot if available when a vehicle is seen),
+     * matches them against Known & Learned plates, and auto-learns new plates to disk & storage.
+     */
+    async evaluateAndLearnPlates(
+        cameraName: string,
+        stage1: Stage1Parsed,
+        bestFrame: Buffer,
+        chain: ProviderConfig[],
+    ): Promise<EvaluatedPlate[]> {
+        if (!this.provider.isPlateRecognitionEnabled() || !stage1.alert)
+            return [];
+
+        const hasVehicle =
+            stage1.objects.includes('vehicle') ||
+            stage1.vehicles.length > 0 ||
+            stage1.licensePlates.length > 0 ||
+            /\b(vehicle|car|truck|suv|van|sedan|tesla|pickup|license\s+plate)\b/i.test(stage1.summary);
+        if (!hasVehicle)
+            return [];
+
+        // Grab a full-resolution picture from the camera if available so small license plate characters are readable
+        let hiResFrame = bestFrame;
+        if (this.mixinDevice.takePicture) {
+            try {
+                const pic = await this.mixinDevice.takePicture({ reason: 'event' });
+                const buf = await mediaManager.convertMediaObjectToBuffer(pic, 'image/jpeg');
+                if (buf.length > bestFrame.length)
+                    hiResFrame = buf;
+            } catch {
+                // use bestFrame
+            }
+        }
+
+        const rawPlates = new Map<string, { vehicleDesc?: string; box?: [number, number, number, number]; confidence: number }>();
+        for (const p of stage1.licensePlates) {
+            if (isValidPlateCandidate(p)) {
+                rawPlates.set(cleanPlateString(p), {
+                    vehicleDesc: stage1.vehicles[0],
+                    confidence: 0.9,
+                });
+            }
+        }
+
+        // If Stage 1 saw a vehicle (e.g. "a red Tesla with a visible license plate") but didn't read the characters yet,
+        // run a dedicated high-resolution ALPR / OCR pass!
+        if (rawPlates.size === 0) {
+            try {
+                const ocrReq: ModelRequest = {
+                    system: PLATE_OCR_SYSTEM_PROMPT,
+                    prompt:
+                        `Camera: ${cameraName}\n` +
+                        `Vehicle context: ${stage1.vehicles.join(', ') || stage1.summary}\n` +
+                        'Read the exact alphanumeric characters on any visible license plate on the vehicle(s). ' +
+                        'Return JSON only: {"plates": [{"plate": "ABC1234", "vehicle": "red Tesla", "box": [0.3, 0.5, 0.2, 0.1], "confidence": 0.9}]}',
+                    jpegs: [hiResFrame],
+                    maxTokens: 160,
+                    timeoutMs: this.provider.timeoutMs(),
+                    jsonMode: true,
+                };
+                const { text: ocrText } = await this.runWithProviderChain(chain, ocrReq);
+                const m = ocrText.match(/\{[\s\S]*\}/);
+                if (m) {
+                    const parsed = JSON.parse(m[0]);
+                    if (Array.isArray(parsed.plates)) {
+                        for (const item of parsed.plates) {
+                            const cand = String(item?.plate ?? '').trim();
+                            if (!isValidPlateCandidate(cand))
+                                continue;
+                            const norm = cleanPlateString(cand);
+                            let box: [number, number, number, number] | undefined;
+                            if (Array.isArray(item.box) && item.box.length === 4) {
+                                const nums = item.box.map((n: unknown) => Math.max(0, Math.min(1, Number(n) || 0)));
+                                if (nums[2] > 0 && nums[3] > 0)
+                                    box = [nums[0], nums[1], nums[2], nums[3]];
+                            }
+                            rawPlates.set(norm, {
+                                vehicleDesc: String(item?.vehicle ?? stage1.vehicles[0] ?? '').trim() || undefined,
+                                box,
+                                confidence: Math.max(0.5, Math.min(1, Number(item?.confidence) || 0.9)),
+                            });
+                        }
+                    }
+                }
+            } catch (e) {
+                this.console.warn('License plate OCR pass failed:', errMsg(e));
+            }
+        }
+
+        if (rawPlates.size === 0)
+            return [];
+
+        const out: EvaluatedPlate[] = [];
+        for (const [plateNum, info] of rawPlates.entries()) {
+            const evaluated = await this.provider.matchOrLearnPlate(
+                cameraName,
+                plateNum,
+                info.vehicleDesc,
+                info.confidence,
+                hiResFrame,
+                info.box,
+            );
+            out.push(evaluated);
+        }
+        return out;
+    }
+
     /** Schedules a ~3s confirmation re-check if there are pending multi-frame face confirmations within the 30s window. */
     scheduleConfirmationRecheckIfNeeded() {
         if (this.recheckTimer)
@@ -2331,29 +2819,40 @@ class AIAlertsMixin
                 }
             }
 
-            // For multi-image capable models, include the previous baseline frame as Image #1 so the AI can visually spot
-            // cars arriving/leaving, a black car replaced by a red car, or idle objects moving.
-            // (Single-image models like llava automatically receive only the latest frame inside callModel.)
+            // Only attach the previous baseline image into Stage 1 for large cloud models (>10B).
+            // Compact local Ollama vision models (llava, qwen2.5vl:3b/7b, minicpm-v, moondream, etc.) frequently report a person
+            // from the OLD baseline Image #1 as if they are still standing there in the current frame after they walked away!
+            // Instead, we compute the pixel diff in code (computeFrameChange) and pass only the CURRENT live frame(s) to Ollama.
+            const primaryProvider = chain[0]?.provider;
             const primaryModel = chain[0]?.model?.trim() || PROVIDER_DEFAULTS[chain[0].provider].model;
-            const includeBaselineImage = hasPrevBaseline && !isSingleImageOnlyModel(primaryModel);
-            const stage1Frames = includeBaselineImage ? [this.lastBaselineJpeg!, ...cameraJpegs] : cameraJpegs;
+            const includeBaselineImage =
+                hasPrevBaseline &&
+                primaryProvider !== 'ollama' &&
+                !isSingleImageOnlyModel(primaryModel) &&
+                !/\b([1-8]b|mini|nano|small|tiny)\b/i.test(primaryModel);
+            const stage1Frames = includeBaselineImage
+                ? [this.lastBaselineJpeg!, ...cameraJpegs]
+                : primaryProvider === 'ollama'
+                    ? [latestJpeg]
+                    : cameraJpegs;
 
             const started = Date.now();
+            const built = buildPrompt(
+                cameraName,
+                s.rules,
+                stage1Frames.length,
+                interval,
+                String(s.saveEvidence ?? '').startsWith('Let the AI')
+                    ? s.evidenceRules || DEFAULT_EVIDENCE_RULES
+                    : undefined,
+                activeHint,
+                diffInfo,
+                hasPrevBaseline ? this.lastBaselineSummary : undefined,
+                includeBaselineImage,
+            );
             const stage1Req: ModelRequest = {
-                system: DEFAULT_SYSTEM_PROMPT,
-                prompt: buildPrompt(
-                    cameraName,
-                    s.rules || DEFAULT_RULES,
-                    stage1Frames.length,
-                    interval,
-                    String(s.saveEvidence ?? '').startsWith('Let the AI')
-                        ? s.evidenceRules || DEFAULT_EVIDENCE_RULES
-                        : undefined,
-                    activeHint,
-                    diffInfo,
-                    hasPrevBaseline ? this.lastBaselineSummary : undefined,
-                    includeBaselineImage,
-                ),
+                system: built.system,
+                prompt: built.prompt,
                 jpegs: stage1Frames,
                 maxTokens: 450,
                 timeoutMs: this.provider.timeoutMs(),
@@ -2371,6 +2870,8 @@ class AIAlertsMixin
 
             const allCandidates: DetectedFaceCandidate[] = [...(activeHint?.faces ?? []), ...stage1.aiFaces];
             const evaluatedFaces = await this.evaluateFaces(allCandidates, cameraJpegs, chain);
+            const evaluatedPlates = await this.evaluateAndLearnPlates(cameraName, stage1, bestFrame, chain);
+            const allPlateNumbers = Array.from(new Set([...stage1.licensePlates, ...evaluatedPlates.map(p => p.plate)]));
 
             const windowMs = this.provider.confirmationWindowMs(); // 30s
             const knownReqFrames = this.provider.knownConfirmFrames(); // default 2
@@ -2526,7 +3027,8 @@ class AIAlertsMixin
                 faces: confirmedKnownNames,
                 unknownFacesCount,
                 evaluatedFaces,
-                licensePlates: stage1.licensePlates,
+                licensePlates: allPlateNumbers,
+                evaluatedPlates,
                 vehicles: stage1.vehicles,
                 deliveryCarrier: stage1.deliveryCarrier,
                 carriedItems: stage1.carriedItems,
@@ -2542,7 +3044,7 @@ class AIAlertsMixin
                     severity: verdict.severity,
                     summary: verdict.summary,
                     objects: verdict.objects,
-                    licensePlates: verdict.licensePlates,
+                    licensePlates: evaluatedPlates.map(p => `${p.plate} (${p.status}: ${p.label})`),
                     deliveryCarrier: verdict.deliveryCarrier,
                     carriedItems: verdict.carriedItems,
                     confirmedFaces: verdict.faces,
@@ -2631,6 +3133,17 @@ class AIAlertsMixin
                 }
             }
 
+            // If a known license plate is on the "Never notify for these license plates" list and no unknown person is seen, suppress alert
+            if (!force && evaluatedPlates.length > 0 && !verdict.objects.includes('person')) {
+                const allPlatesMuted = evaluatedPlates.every(p => this.provider.isPlateSuppressed(p.plate, p.label));
+                if (allPlatesMuted) {
+                    this.console.log(
+                        `Alert suppressed for muted license plate(s): ${evaluatedPlates.map(p => `${p.plate} (${p.label})`).join(', ')}`,
+                    );
+                    return;
+                }
+            }
+
             if (!force && faceMode === 'Only alert when a recognized known face is seen' && confirmedKnownNames.length === 0)
                 return;
 
@@ -2657,7 +3170,7 @@ class AIAlertsMixin
             else if (choice === 'Snapshot + clip') plan = 'both';
             else if (choice.startsWith('Let the AI')) plan = verdict.save;
 
-            // Build rich metadata tags (Known vs Unrecognized face, Courier, Carried items, License plates, Objects)
+            // Build rich metadata tags (Known vs Unrecognized face, Courier, Carried items, Recognized/Learned License Plates, Objects)
             const metaTags: string[] = [];
             if (verdict.faces.length)
                 metaTags.push(`Recognized: ${verdict.faces.join(', ')}`);
@@ -2667,9 +3180,19 @@ class AIAlertsMixin
                 metaTags.push(`Courier: ${verdict.deliveryCarrier}`);
             if (verdict.carriedItems.length)
                 metaTags.push(`Carrying: ${verdict.carriedItems.join(', ')}`);
-            if (verdict.licensePlates.length)
+            if (verdict.evaluatedPlates.length) {
+                const plateLabels = verdict.evaluatedPlates.map(p =>
+                    p.status === 'known'
+                        ? `${p.plate} (${p.label})`
+                        : p.status === 'learned'
+                            ? `${p.plate} (Recognized: ${p.label})`
+                            : `${p.plate} (New plate saved: ${p.label})`,
+                );
+                metaTags.push(`Plate: ${plateLabels.join(', ')}`);
+            } else if (verdict.licensePlates.length) {
                 metaTags.push(`Plate: ${verdict.licensePlates.join(', ')}`);
-            if (verdict.vehicles.length)
+            }
+            if (verdict.vehicles.length && !verdict.summary.includes('Vehicle:'))
                 metaTags.push(`Vehicle: ${verdict.vehicles.join(', ')}`);
             const notableObjects = verdict.objects.filter(o => OBJECT_FILTER_CHOICES.includes(o) && o !== 'face');
             if (notableObjects.length)
@@ -2776,6 +3299,18 @@ class AIAlertsMixin
             const notifier = systemManager.getDeviceById<Notifier>(id);
             if (!notifier)
                 continue;
+            const devInfo = systemManager.getDeviceById(id);
+            const isHomeAssistantNotifier =
+                (devInfo?.pluginId === '@scrypted/homeassistant' ||
+                    /home\s*assistant|ha\s*notify|mobile_app|iphone|ipad/i.test(
+                        `${devInfo?.name ?? ''} ${devInfo?.nativeId ?? ''} ${devInfo?.type ?? ''}`,
+                    )) &&
+                this.provider.haConfigured();
+            if (isHomeAssistantNotifier && alert.sent.includes('Home Assistant')) {
+                // Already delivered via our built-in Home Assistant channel (Persistent + Mobile App);
+                // skip duplicate call to @scrypted/homeassistant Notifier which often throws HTTP 400 on custom options/media.
+                continue;
+            }
             try {
                 await notifier.sendNotification(
                     title,
@@ -2803,7 +3338,13 @@ class AIAlertsMixin
                     media,
                 );
             } catch (e) {
-                this.console.error(`Notification to ${id} failed`, e);
+                // Retry with minimal payload if the notifier rejected custom data/media
+                try {
+                    await notifier.sendNotification(title, { body: messageWithTime });
+                } catch {
+                    if (!alert.sent.includes('Home Assistant'))
+                        this.console.error(`Notification to ${id} failed`, e);
+                }
             }
         }
     }
@@ -2819,6 +3360,9 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
     faceCacheKey = '';
     faceCache: FaceReference[] = [];
     recentLines: string[] = [];
+    recentPlateLines: string[] = [];
+    learnedPlatesMap = new Map<string, KnownPlateEntry>();
+    learnedPlatesLoaded = false;
     lastSnapshotCleanup = 0;
 
     storageSettings = new StorageSettings(this, {
@@ -3062,6 +3606,68 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
                 this.recentLines = [];
                 await this.storageSettings.putSetting('recentRecognitions', 'No face recognitions recorded yet.');
                 this.console.log('Cleared recent recognitions history.');
+            },
+        },
+
+        /* ---------------- License Plate Recognition (LPR / ALPR) ---------------- */
+        enablePlateRecognition: {
+            group: 'License Plate Recognition (LPR)',
+            title: 'Enable license plate reading & recognition',
+            description:
+                'Reads license plate numbers on vehicles, matches them against known & learned plates, and saves new plates for future reference.',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        knownPlatesEntries: {
+            group: 'License Plate Recognition (LPR)',
+            title: 'Known license plates (Owner / Vehicle Label = PLATE)',
+            description:
+                'One vehicle per line as "Label = PLATE_NUMBER" (spaces/hyphens ignored; handles OCR-confusable characters like 0/O and 8/B). ' +
+                'Example: Red Tesla (Tai) = 8ABC123',
+            type: 'textarea',
+            placeholder: 'Red Tesla (Tai) = 8ABC123\nFamily SUV = 7XYZ999',
+        },
+        autoLearnUnknownPlates: {
+            group: 'License Plate Recognition (LPR)',
+            title: 'Auto-learn & save unrecognized license plates for future reference',
+            description:
+                'Automatically saves every new license plate number and vehicle snapshot to the Learned plates directory below so returning vehicles are recognized.',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        learnedPlatesDir: {
+            group: 'License Plate Recognition (LPR)',
+            title: 'Learned license plates directory',
+            description:
+                'Where snapshots and the learned license plate database (plates_db.json) are stored. On Home Assistant OS add-on, /media/plates/learned is in HA Media.',
+            placeholder: '/media/plates/learned',
+            defaultValue: '/media/plates/learned',
+        },
+        neverNotifyPlates: {
+            group: 'License Plate Recognition (LPR)',
+            title: 'Never notify for these license plates / owners',
+            description:
+                'Comma-separated plate numbers or owner labels to silence when no stranger is present (or type "family" to silence all Known license plates above).',
+            placeholder: '8ABC123, Red Tesla (Tai)',
+            defaultValue: '',
+        },
+        recentPlates: {
+            group: 'License Plate Recognition (LPR)',
+            title: 'Learned & recent license plates',
+            description:
+                'Lists every read license plate with timestamp, camera, plate number, matched owner or auto-learned vehicle description.',
+            type: 'textarea',
+            readonly: true,
+            defaultValue: 'No license plates recorded yet.',
+        },
+        clearRecentPlates: {
+            group: 'License Plate Recognition (LPR)',
+            title: 'Clear recent license plates log',
+            type: 'button',
+            onPut: async () => {
+                this.recentPlateLines = [];
+                await this.storageSettings.putSetting('recentPlates', 'No license plates recorded yet.');
+                this.console.log('Cleared recent license plates log.');
             },
         },
 
@@ -3370,6 +3976,10 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         ) {
             this.faceCacheKey = '';
         }
+        if (key === 'learnedPlatesDir') {
+            this.learnedPlatesLoaded = false;
+            this.learnedPlatesMap.clear();
+        }
     }
 
     formatTimestamp(date = new Date()): string {
@@ -3429,6 +4039,232 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         if (entries.includes('family') || entries.includes('all') || entries.includes('*'))
             return true;
         return entries.includes(personName.trim().toLowerCase());
+    }
+
+    /* ---------------- License Plate Recognition & Auto-Learning ---------------- */
+
+    isPlateRecognitionEnabled(): boolean {
+        return Boolean(this.storageSettings.values.enablePlateRecognition ?? true);
+    }
+
+    isPlateSuppressed(plate: string, label: string): boolean {
+        const raw = String(this.storageSettings.values.neverNotifyPlates ?? '').trim();
+        if (!raw)
+            return false;
+        const entries = raw
+            .split(',')
+            .map(s => s.trim().toLowerCase())
+            .filter(Boolean);
+        if (entries.includes('all') || entries.includes('*'))
+            return true;
+        const normPlate = cleanPlateString(plate).toLowerCase();
+        const normLabel = label.trim().toLowerCase();
+        // If "family" is specified, suppress any plate explicitly listed in Known license plates
+        if (entries.includes('family')) {
+            const known = this.parseKnownPlatesList();
+            if (known.some(k => plateSimilarity(k.plate, plate) >= 0.85))
+                return true;
+        }
+        return entries.some(e => cleanPlateString(e).toLowerCase() === normPlate || e === normLabel);
+    }
+
+    parseKnownPlatesList(): KnownPlateEntry[] {
+        const raw = String(this.storageSettings.values.knownPlatesEntries ?? '').trim();
+        if (!raw)
+            return [];
+        const out: KnownPlateEntry[] = [];
+        for (const line of raw.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#'))
+                continue;
+            const eqIdx = trimmed.indexOf('=');
+            if (eqIdx <= 0)
+                continue;
+            const left = trimmed.slice(0, eqIdx).trim();
+            const right = trimmed.slice(eqIdx + 1).trim();
+            if (!left || !right)
+                continue;
+            // Support either "Label = PLATE" or "PLATE = Label"
+            const rightClean = cleanPlateString(right);
+            const leftClean = cleanPlateString(left);
+            if (isValidPlateCandidate(right) && rightClean.length <= 9 && !/\s/.test(right)) {
+                out.push({ plate: rightClean, normalizedKey: canonicalPlateSkeleton(rightClean), label: left, isLearned: false });
+            } else if (isValidPlateCandidate(left) && leftClean.length <= 9 && !/\s/.test(left)) {
+                out.push({ plate: leftClean, normalizedKey: canonicalPlateSkeleton(leftClean), label: right, isLearned: false });
+            } else {
+                out.push({ plate: rightClean, normalizedKey: canonicalPlateSkeleton(rightClean), label: left, isLearned: false });
+            }
+        }
+        return out;
+    }
+
+    async ensureLearnedPlatesLoaded(): Promise<void> {
+        if (this.learnedPlatesLoaded)
+            return;
+        this.learnedPlatesLoaded = true;
+        const dir = String(this.storageSettings.values.learnedPlatesDir ?? '/media/plates/learned').trim();
+        if (!dir)
+            return;
+        try {
+            const dbPath = path.join(path.resolve(dir), 'plates_db.json');
+            const raw = await fs.readFile(dbPath, 'utf-8');
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) {
+                for (const item of arr) {
+                    if (item?.plate && item?.label) {
+                        const clean = cleanPlateString(String(item.plate));
+                        if (!isValidPlateCandidate(clean))
+                            continue;
+                        this.learnedPlatesMap.set(clean, {
+                            plate: clean,
+                            normalizedKey: canonicalPlateSkeleton(clean),
+                            label: String(item.label),
+                            isLearned: true,
+                            firstSeen: item.firstSeen ? String(item.firstSeen) : undefined,
+                        });
+                    }
+                }
+            }
+        } catch {
+            // plates_db.json does not exist yet
+        }
+    }
+
+    async matchOrLearnPlate(
+        cameraName: string,
+        rawPlate: string,
+        vehicleDesc: string | undefined,
+        confidence: number,
+        frameJpeg: Buffer,
+        box?: [number, number, number, number],
+    ): Promise<EvaluatedPlate> {
+        const plate = cleanPlateString(rawPlate);
+        await this.ensureLearnedPlatesLoaded();
+
+        // 1. Check against user's Known license plates list (with fuzzy OCR-confusable matching >= 0.85)
+        const knownList = this.parseKnownPlatesList();
+        let bestKnown: KnownPlateEntry | undefined;
+        let bestKnownSim = 0;
+        for (const k of knownList) {
+            const sim = plateSimilarity(plate, k.plate);
+            if (sim >= 0.85 && sim > bestKnownSim) {
+                bestKnownSim = sim;
+                bestKnown = k;
+            }
+        }
+        if (bestKnown) {
+            const result: EvaluatedPlate = {
+                plate: bestKnown.plate,
+                status: 'known',
+                label: bestKnown.label,
+                vehicleDesc,
+                confidence,
+                box,
+            };
+            this.recordPlateRecognition(cameraName, result);
+            return result;
+        }
+
+        // 2. Check against previously auto-learned plates (with fuzzy OCR-confusable matching >= 0.86)
+        let bestLearned: KnownPlateEntry | undefined;
+        let bestLearnedSim = 0;
+        for (const l of this.learnedPlatesMap.values()) {
+            const sim = plateSimilarity(plate, l.plate);
+            if (sim >= 0.86 && sim > bestLearnedSim) {
+                bestLearnedSim = sim;
+                bestLearned = l;
+            }
+        }
+        if (bestLearned) {
+            const result: EvaluatedPlate = {
+                plate: bestLearned.plate,
+                status: 'learned',
+                label: bestLearned.label,
+                vehicleDesc,
+                confidence,
+                box,
+            };
+            this.recordPlateRecognition(cameraName, result);
+            return result;
+        }
+
+        // 3. Brand new plate: auto-learn and save snapshot + database entry to learnedPlatesDir
+        const ts = this.formatTimestamp(new Date());
+        const label = vehicleDesc ? `${vehicleDesc} (first seen ${ts})` : `Vehicle at ${cameraName} (first seen ${ts})`;
+        let savedPath: string | undefined;
+
+        const v = this.storageSettings.values;
+        if (v.autoLearnUnknownPlates) {
+            const dir = String(v.learnedPlatesDir ?? '/media/plates/learned').trim();
+            if (dir) {
+                try {
+                    const resolvedDir = path.resolve(dir);
+                    await fs.mkdir(resolvedDir, { recursive: true });
+                    let snapshotToSave = frameJpeg;
+                    if (box) {
+                        try {
+                            const ffmpegPath = await mediaManager.getFFmpegPath();
+                            snapshotToSave = await cropFaceJpeg(ffmpegPath, frameJpeg, box);
+                        } catch {
+                            snapshotToSave = frameJpeg;
+                        }
+                    }
+                    const safeVeh = (vehicleDesc ?? cameraName).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30);
+                    const imgFile = path.join(resolvedDir, `Plate_${plate}_${safeVeh}.jpg`);
+                    await fs.writeFile(imgFile, snapshotToSave);
+                    savedPath = imgFile;
+
+                    const entry: KnownPlateEntry = {
+                        plate,
+                        normalizedKey: canonicalPlateSkeleton(plate),
+                        label,
+                        isLearned: true,
+                        firstSeen: ts,
+                    };
+                    this.learnedPlatesMap.set(plate, entry);
+                    const dbPath = path.join(resolvedDir, 'plates_db.json');
+                    await fs.writeFile(dbPath, JSON.stringify(Array.from(this.learnedPlatesMap.values()), null, 2));
+                    this.console.log(`Auto-learned new license plate "${plate}" (${label}) -> saved to ${imgFile}`);
+                } catch (e) {
+                    this.console.warn(`Could not save learned plate "${plate}": ${errMsg(e)}`);
+                }
+            }
+        }
+
+        const result: EvaluatedPlate = {
+            plate,
+            status: 'new',
+            label: vehicleDesc || 'New vehicle',
+            vehicleDesc,
+            confidence,
+            box,
+            savedPath,
+        };
+        this.recordPlateRecognition(cameraName, result);
+        return result;
+    }
+
+    recordPlateRecognition(cameraName: string, ep: EvaluatedPlate) {
+        const ts = this.formatTimestamp(new Date());
+        const statusDesc =
+            ep.status === 'known'
+                ? `KNOWN (${ep.label})`
+                : ep.status === 'learned'
+                    ? `RECOGNIZED LEARNED PLATE (${ep.label})`
+                    : `NEW PLATE SAVED (${ep.label})`;
+        const line = `${ts} [${cameraName}] Plate: ${ep.plate} — ${statusDesc}`;
+
+        if (!this.recentPlateLines.length) {
+            const existing = String(this.storageSettings.values.recentPlates ?? '');
+            if (existing && !existing.startsWith('No license plates'))
+                this.recentPlateLines = existing.split('\n').filter(Boolean);
+        }
+        this.recentPlateLines.unshift(line);
+        if (this.recentPlateLines.length > 30)
+            this.recentPlateLines.length = 30;
+
+        this.storageSettings.putSetting('recentPlates', this.recentPlateLines.join('\n')).catch(() => {});
+        this.console.log(`License plate: ${line}`);
     }
 
     recordRecognition(
@@ -4091,10 +4927,37 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         tag?: string,
     ): Promise<boolean> {
         const v = this.storageSettings.values;
-        const base =
-            String(v.haUrl ?? '').trim().replace(/\/+$/, '') ||
-            (process.env.SUPERVISOR_TOKEN ? 'http://supervisor/core' : '');
-        const token = String(v.haToken ?? '').trim() || process.env.SUPERVISOR_TOKEN || '';
+        const explicitUrl = String(v.haUrl ?? '').trim().replace(/\/+$/, '');
+        const explicitToken = String(v.haToken ?? '').trim();
+        const supToken = process.env.SUPERVISOR_TOKEN || '';
+
+        const candidates: { base: string; token: string }[] = [];
+        if (explicitUrl && explicitToken)
+            candidates.push({ base: explicitUrl, token: explicitToken });
+        if (supToken && explicitUrl !== 'http://supervisor/core')
+            candidates.push({ base: 'http://supervisor/core', token: supToken });
+        if (!candidates.length && explicitUrl && supToken)
+            candidates.push({ base: explicitUrl, token: supToken });
+        if (!candidates.length)
+            return false;
+
+        const postHaWithFallback = async (apiPath: string, body: unknown, timeoutMs = 15000): Promise<any> => {
+            let lastErr: unknown;
+            for (const cand of candidates) {
+                try {
+                    return await postJson(
+                        `${cand.base}${apiPath}`,
+                        { authorization: `Bearer ${cand.token}` },
+                        body,
+                        timeoutMs,
+                    );
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            throw lastErr;
+        };
+
         const rawServices = String(v.haNotifyServices ?? '')
             .split(',')
             .map(x => x.trim().replace(/^notify\./, ''))
@@ -4104,27 +4967,27 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
             rawServices.some(s => s === 'persistent_notification' || s === 'persistent_notification.create');
         let services = rawServices.filter(s => s !== 'persistent_notification' && s !== 'persistent_notification.create');
 
-        if (!base || !token)
-            return false;
-
         // Auto-discover all mobile_app_* notify services from Home Assistant if none were manually entered
         if (!services.length) {
-            try {
-                const res = await fetch(`${base}/api/services`, {
-                    headers: { authorization: `Bearer ${token}` },
-                    signal: AbortSignal.timeout(8000),
-                });
-                if (res.ok) {
-                    const domains = await res.json();
-                    if (Array.isArray(domains)) {
-                        const notifyDomain = domains.find((d: any) => d?.domain === 'notify');
-                        if (notifyDomain?.services && typeof notifyDomain.services === 'object') {
-                            services = Object.keys(notifyDomain.services).filter(k => k.startsWith('mobile_app_'));
+            for (const cand of candidates) {
+                try {
+                    const res = await fetch(`${cand.base}/api/services`, {
+                        headers: { authorization: `Bearer ${cand.token}` },
+                        signal: AbortSignal.timeout(8000),
+                    });
+                    if (res.ok) {
+                        const domains = await res.json();
+                        if (Array.isArray(domains)) {
+                            const notifyDomain = domains.find((d: any) => d?.domain === 'notify');
+                            if (notifyDomain?.services && typeof notifyDomain.services === 'object') {
+                                services = Object.keys(notifyDomain.services).filter(k => k.startsWith('mobile_app_'));
+                            }
                         }
+                        break;
                     }
+                } catch {
+                    // try next candidate
                 }
-            } catch {
-                // ignore auto-discovery error; persistent_notification still runs
             }
         }
 
@@ -4133,9 +4996,8 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         // 1. Home Assistant Persistent Notification (sidebar bell)
         if (wantPersistent) {
             try {
-                await postJson(
-                    `${base}/api/services/persistent_notification/create`,
-                    { authorization: `Bearer ${token}` },
+                await postHaWithFallback(
+                    '/api/services/persistent_notification/create',
                     {
                         title,
                         message,
@@ -4149,39 +5011,47 @@ export default class AIAlertsPlugin extends ScryptedDeviceBase implements MixinP
         }
 
         // 2. Home Assistant Mobile App / Notify services
+        // Note: iOS Companion App (mobile_app_*_iphone / ipad) rejects Android-only fields like `importance`, `priority`, `ttl`
+        // or non-camera `entity_id` values with HTTP 400 Bad Request. Keep `data` strictly compatible with both iOS and Android.
         const data: Record<string, unknown> = {
-            channel: 'AI Vision Alerts',
-            importance: 'high',
-            priority: 'high',
-            ttl: 0,
+            push: {
+                sound: 'default',
+                'interruption-level': 'time-sensitive',
+            },
         };
         if (tag)
             data.tag = tag;
-        if (cameraEntity) {
-            data.image = `/api/camera_proxy/${cameraEntity}`; // Android
-            data.entity_id = cameraEntity; // iOS
+        if (cameraEntity && /^camera\./i.test(cameraEntity)) {
+            data.image = `/api/camera_proxy/${cameraEntity}`;
+            data.entity_id = cameraEntity;
         } else if (haImageUrl && haImageUrl.startsWith('/local/')) {
             data.image = haImageUrl;
         }
 
         for (const service of services) {
             try {
-                await postJson(
-                    `${base}/api/services/notify/${service}`,
-                    { authorization: `Bearer ${token}` },
+                await postHaWithFallback(
+                    `/api/services/notify/${service}`,
                     { title, message, data },
                     15000,
                 );
             } catch (e) {
                 try {
-                    await postJson(
-                        `${base}/api/services/notify/${service}`,
-                        { authorization: `Bearer ${token}` },
+                    await postHaWithFallback(
+                        `/api/services/notify/${service}`,
                         { title, message },
                         15000,
                     );
                 } catch {
-                    errors.push(`${service}: ${errMsg(e)}`);
+                    try {
+                        await postHaWithFallback(
+                            `/api/services/notify/${service}`,
+                            { message: `${title}: ${message}` },
+                            15000,
+                        );
+                    } catch {
+                        errors.push(`${service}: ${errMsg(e)}`);
+                    }
                 }
             }
         }

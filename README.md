@@ -28,9 +28,19 @@ archiving, and webhook integrations.
    a car pulls in or leaves, when a **black car is replaced by a red car**, when
    an idle object (chair, bicycle, trash can) suddenly moves, or when a human or
    animal appears.
-5. **License Plate Reading (LPR / ANPR):** Reads visible vehicle license plates
-   (`licensePlates`) and vehicle color/type (`vehicles`), including them in
-   notifications, Scrypted `ObjectDetector` events, and webhooks.
+5. **License Plate Reading (ALPR / OCR), Recognition & Auto-Learning:**
+   - Reads visible vehicle license plate characters (`licensePlates`) using both
+     Stage 1 extraction and a dedicated high-resolution ALPR/OCR pass when a
+     vehicle is detected.
+   - Matches read plates against your **Known license plates** list (e.g.
+     `Red Tesla (Tai) = 8ABC123`), with OCR-confusable fuzzy matching (`0/O`,
+     `1/I`, `8/B`, `5/S`).
+   - **Auto-learns new license plates:** Saves vehicle/plate snapshots and a
+     persistent `plates_db.json` database to `/media/plates/learned`, logs them
+     in the **Learned & recent license plates** panel on the plugin page, and
+     automatically recognizes returning vehicles on future visits.
+   - Includes **Never notify for these license plates / owners** to silence
+     alerts for family vehicles when no stranger is present.
 6. **Delivery Couriers vs. Personal Items:** Distinguishes **DHL, Amazon, FedEx,
    USPS, and UPS** couriers (by uniform, logo, or van) and real delivery packages
    from people carrying **handbags, purses, backpacks, trash bags, or groceries**.
