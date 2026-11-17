@@ -1948,7 +1948,7 @@ const PROVIDER_DEFAULTS = {
     ollama: { baseUrl: 'http://localhost:11434', model: 'llama3.2-vision' },
     custom: { baseUrl: '', model: '' },
 };
-/** Returns true if the provider is local Ollama or points to a local/LAN server (never subject to daily quota limits). */
+/** Returns true if the provider is local Ollama or points to a local/LAN server (never subject to cloud billing quota). */
 function isLocalProvider(cfg) {
     if (cfg.provider === 'ollama')
         return true;
@@ -1960,6 +1960,11 @@ function isLocalProvider(cfg) {
         url.includes(':11434') ||
         url.includes('.local') ||
         /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(url));
+}
+/** Returns true only for older single-image-only models (e.g. llava 1.5/1.6, bakllava, moondream). */
+function isSingleImageOnlyModel(modelName) {
+    const m = modelName.toLowerCase();
+    return m.includes('llava') || m.includes('bakllava') || m.includes('moondream');
 }
 /** Returns a message if the provider is missing required settings, otherwise undefined. */
 function validateConfig(cfg) {
@@ -1977,20 +1982,69 @@ function validateConfig(cfg) {
     }
 }
 /* ------------------------------------------------------------------ */
-/* Object & Face Recognition types, quality gates & similarity math     */
+/* Date & Time formatting based on device / configured timezone         */
+/* ------------------------------------------------------------------ */
+function formatDeviceDateTime(date, timeZone) {
+    const tz = timeZone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+    try {
+        return new Intl.DateTimeFormat('en-US', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true,
+            timeZoneName: 'short',
+        }).format(date);
+    }
+    catch {
+        return date.toLocaleString();
+    }
+}
+function formatSafeFileTimestamp(date, timeZone) {
+    const tz = timeZone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+    try {
+        const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+        }).formatToParts(date);
+        const get = (t) => parts.find(p => p.type === t)?.value ?? '00';
+        const dateFolder = `${get('year')}-${get('month')}-${get('day')}`;
+        const fileStamp = `${dateFolder}_${get('hour')}-${get('minute')}-${get('second')}`;
+        return { dateFolder, fileStamp };
+    }
+    catch {
+        const iso = date.toISOString();
+        return {
+            dateFolder: iso.slice(0, 10),
+            fileStamp: iso.slice(0, 19).replace(/[:T]/g, '-'),
+        };
+    }
+}
+/* ------------------------------------------------------------------ */
+/* Object, Courier, License Plate & Face Recognition types              */
 /* ------------------------------------------------------------------ */
 const OBJECT_FILTER_CHOICES = ['person', 'face', 'vehicle', 'package', 'animal'];
 const TRIGGER_CHOICES = [
-    'Smart Object/Face Detection (fallback to Motion if unsupported)',
-    'Smart Object/Face Detection only',
-    'Motion sensor only',
     'Both Motion and Smart Object/Face Detection',
+    'Motion sensor only',
+    'Smart Object/Face Detection only',
 ];
 const FACE_ALERT_MODES = [
-    'Arrival alerts + identify in security alerts',
-    'Suppress security alerts when only known faces are seen',
-    'Only alert when a known face is recognized',
+    'Alert on both recognized faces and unrecognized faces',
+    'Suppress alerts when only recognized known faces are seen',
+    'Only alert when a recognized known face is seen',
+    'Only alert when an unrecognized face/stranger is seen',
 ];
+const DELIVERY_CARRIERS = ['Amazon', 'FedEx', 'UPS', 'USPS', 'DHL'];
 /** Reads pixel dimensions [width, height] directly from a JPEG buffer's SOF marker. */
 function getJpegDimensions(buf) {
     if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8)
@@ -2013,7 +2067,6 @@ function getJpegDimensions(buf) {
         const len = buf.readUInt16BE(offset + 2);
         if (len < 2 || offset + 2 + len > buf.length)
             break;
-        // SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15
         if ((marker >= 0xc0 && marker <= 0xc3) ||
             (marker >= 0xc5 && marker <= 0xc7) ||
             (marker >= 0xc9 && marker <= 0xcb) ||
@@ -2103,7 +2156,6 @@ async function analyzeFacePatch(ffmpegPath, jpeg, box) {
         });
         if (raw.length < SIZE * SIZE * 3)
             return undefined;
-        // Convert to grayscale and compute 2D Laplacian variance for sharpness
         const gray = new Float32Array(SIZE * SIZE);
         for (let i = 0; i < SIZE * SIZE; i++) {
             const r = raw[i * 3];
@@ -2129,9 +2181,7 @@ async function analyzeFacePatch(ffmpegPath, jpeg, box) {
         }
         const mean = lapSum / count;
         const variance = lapSqSum / count - mean * mean;
-        // Normalize variance into a 0..100+ sharpness score (sharp faces typically >= 18)
         const sharpnessScore = Math.round((variance / 12) * 10) / 10;
-        // Build a 12x12x3 spatial color + gradient descriptor (432-dim L2-normalized vector)
         const GRID = 12;
         const cell = SIZE / GRID;
         const desc = [];
@@ -2165,7 +2215,60 @@ async function analyzeFacePatch(ffmpegPath, jpeg, box) {
         await fs__namespace.rm(dir, { recursive: true, force: true });
     }
 }
-/** Maps raw object labels (e.g. 'car', 'dog', 'parcel') into both specific labels and canonical categories. */
+/** Crops a face from a full frame with 25% margin around the bounding box and saves as a clean JPEG for auto-learning. */
+async function cropFaceJpeg(ffmpegPath, jpeg, box) {
+    const [imgW, imgH] = getJpegDimensions(jpeg);
+    const padX = box[2] * 0.25;
+    const padY = box[3] * 0.25;
+    const nx = Math.max(0, box[0] - padX);
+    const ny = Math.max(0, box[1] - padY);
+    const nw = Math.min(1 - nx, box[2] + padX * 2);
+    const nh = Math.min(1 - ny, box[3] + padY * 2);
+    const x = Math.max(0, Math.min(imgW - 32, Math.round(nx * imgW)));
+    const y = Math.max(0, Math.min(imgH - 32, Math.round(ny * imgH)));
+    const w = Math.max(32, Math.min(imgW - x, Math.round(nw * imgW)));
+    const h = Math.max(32, Math.min(imgH - y, Math.round(nh * imgH)));
+    const dir = await fs__namespace.mkdtemp(path__namespace.join(os__namespace.tmpdir(), 'ai-learn-'));
+    try {
+        const inFile = path__namespace.join(dir, 'in.jpg');
+        const outFile = path__namespace.join(dir, 'crop.jpg');
+        await fs__namespace.writeFile(inFile, jpeg);
+        await new Promise((resolve, reject) => {
+            const p = child_process.spawn(ffmpegPath, [
+                '-nostdin',
+                '-hide_banner',
+                '-loglevel',
+                'error',
+                '-i',
+                inFile,
+                '-vf',
+                `crop=${w}:${h}:${x}:${y},scale=min(384\\,iw):-2`,
+                '-frames:v',
+                '1',
+                '-q:v',
+                '4',
+                outFile,
+            ], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+            const timer = setTimeout(() => p.kill('SIGKILL'), 8000);
+            p.on('error', e => {
+                clearTimeout(timer);
+                reject(e);
+            });
+            p.on('close', () => {
+                clearTimeout(timer);
+                resolve();
+            });
+        });
+        return await fs__namespace.readFile(outFile);
+    }
+    catch {
+        return jpeg;
+    }
+    finally {
+        await fs__namespace.rm(dir, { recursive: true, force: true });
+    }
+}
+/** Maps raw object labels into both specific labels and canonical categories ('person', 'face', 'vehicle', 'package', 'animal'). */
 function normalizeObjects(rawObjects, hasFace = false) {
     const out = new Set();
     for (const item of rawObjects) {
@@ -2173,13 +2276,13 @@ function normalizeObjects(rawObjects, hasFace = false) {
         if (!s || s === 'none' || s === 'motion' || s === 'unknown')
             continue;
         out.add(s);
-        if (['person', 'people', 'human', 'pedestrian', 'man', 'woman', 'child', 'adult', 'delivery person'].includes(s))
+        if (['person', 'people', 'human', 'pedestrian', 'man', 'woman', 'child', 'adult', 'delivery person', 'courier'].includes(s))
             out.add('person');
         if (['face', 'human face'].includes(s)) {
             out.add('face');
             out.add('person');
         }
-        if (['vehicle', 'car', 'truck', 'van', 'suv', 'bus', 'motorcycle', 'motorbike', 'bicycle', 'bike', 'scooter'].includes(s))
+        if (['vehicle', 'car', 'truck', 'van', 'suv', 'bus', 'motorcycle', 'motorbike', 'bicycle', 'bike', 'scooter', 'sedan', 'pickup'].includes(s))
             out.add('vehicle');
         if (['package', 'parcel', 'box', 'delivery', 'mail'].includes(s))
             out.add('package');
@@ -2192,24 +2295,148 @@ function normalizeObjects(rawObjects, hasFace = false) {
     }
     return Array.from(out);
 }
-const DEFAULT_SYSTEM_PROMPT = 'You are a home security camera analyst. ' +
-    'You receive still frames sampled from a camera\'s live stream right after activity was detected, oldest first. ' +
-    'Decide whether the camera frames show something the homeowner should be alerted about, considering what changes between frames. ' +
-    'Identify notable objects clearly visible in the frames (such as "person", "vehicle", "car", "truck", "bicycle", "motorcycle", "package", "animal", "dog", "cat"). ' +
-    'Also locate any clearly visible human faces across the frames in "detectedFaces": ' +
-    'for each face, provide {"frame": 1-based frame number, "box": [x, y, width, height] as normalized 0..1 coordinates of the head/face, "sharp": boolean}. ' +
-    'Set "sharp": true ONLY if the face is in focus, front/three-quarter facing, unobstructed, and facial features (eyes, nose, mouth) are clearly distinguishable. ' +
-    'Set "sharp": false if the face is blurry, motion-blurred, in shadow/silhouette, tiny, or turned away. ' +
-    'Set "bestFrame" to the 1-based index of the frame with the clearest view. ' +
-    'Reply with ONLY a JSON object, no markdown: ' +
-    '{"alert": boolean, "severity": "low" | "medium" | "high", "summary": string, "save": "none" | "snapshot" | "clip" | "both", ' +
-    '"objects": string[], "detectedFaces": [{"frame": number, "box": [number, number, number, number], "sharp": boolean}], "bestFrame": number}. ' +
-    'Set "save" by following the evidence rules if they are given, otherwise use "none". ' +
-    'The summary is one short sentence describing what is happening (people, what they are doing, vehicles, packages, animals). ' +
-    'Never guess identities. Be conservative: routine activity such as pets, passing traffic on the street, passing shadows, ' +
-    'headlights, trees/wind, insects, rain, or lighting changes is NOT an alert unless the homeowner rules below say otherwise.';
+/**
+ * Compares the previous baseline frame and current frame on a 32x32 RGB grid using Scrypted's ffmpeg.
+ * Detects both structural/luminance movement AND color changes (e.g. a black car replaced by a red car),
+ * while filtering out global illumination shifts and scattered rain/leaf/wind speckles.
+ */
+async function computeFrameChange(ffmpegPath, prevJpeg, currJpeg) {
+    const GRID = 32;
+    const decodeRgbGrid = async (jpeg) => {
+        const dir = await fs__namespace.mkdtemp(path__namespace.join(os__namespace.tmpdir(), 'ai-diff-'));
+        try {
+            const inFile = path__namespace.join(dir, 'in.jpg');
+            await fs__namespace.writeFile(inFile, jpeg);
+            const raw = await new Promise((resolve, reject) => {
+                const chunks = [];
+                const p = child_process.spawn(ffmpegPath, [
+                    '-nostdin',
+                    '-hide_banner',
+                    '-loglevel',
+                    'error',
+                    '-i',
+                    inFile,
+                    '-vf',
+                    `scale=${GRID}:${GRID}`,
+                    '-frames:v',
+                    '1',
+                    '-f',
+                    'rawvideo',
+                    '-pix_fmt',
+                    'rgb24',
+                    'pipe:1',
+                ], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+                p.stdout.on('data', d => chunks.push(Buffer.from(d)));
+                const timer = setTimeout(() => p.kill('SIGKILL'), 5000);
+                p.on('error', e => {
+                    clearTimeout(timer);
+                    reject(e);
+                });
+                p.on('close', () => {
+                    clearTimeout(timer);
+                    resolve(Buffer.concat(chunks));
+                });
+            });
+            if (raw.length < GRID * GRID * 3)
+                return undefined;
+            return new Uint8Array(raw.buffer, raw.byteOffset, GRID * GRID * 3);
+        }
+        catch {
+            return undefined;
+        }
+        finally {
+            await fs__namespace.rm(dir, { recursive: true, force: true });
+        }
+    };
+    const [rgb1, rgb2] = await Promise.all([decodeRgbGrid(prevJpeg), decodeRgbGrid(currJpeg)]);
+    if (!rgb1 || !rgb2)
+        return undefined;
+    const total = GRID * GRID;
+    let sumLumDiff = 0;
+    const lum1 = new Float32Array(total);
+    const lum2 = new Float32Array(total);
+    for (let i = 0; i < total; i++) {
+        const idx = i * 3;
+        lum1[i] = 0.299 * rgb1[idx] + 0.587 * rgb1[idx + 1] + 0.114 * rgb1[idx + 2];
+        lum2[i] = 0.299 * rgb2[idx] + 0.587 * rgb2[idx + 1] + 0.114 * rgb2[idx + 2];
+        sumLumDiff += lum2[i] - lum1[i];
+    }
+    const meanLumShift = sumLumDiff / total;
+    // A block counts as changed if its illumination-compensated luminance changed >= 18 OR its RGB chroma changed >= 26
+    // (catches a black car replaced by a red car or an object changing color/position)
+    const mask = new Uint8Array(total);
+    let changedCount = 0;
+    for (let i = 0; i < total; i++) {
+        const idx = i * 3;
+        const lumDiff = Math.abs(lum2[i] - lum1[i] - meanLumShift);
+        const rDiff = Math.abs(rgb2[idx] - rgb1[idx] - meanLumShift);
+        const gDiff = Math.abs(rgb2[idx + 1] - rgb1[idx + 1] - meanLumShift);
+        const bDiff = Math.abs(rgb2[idx + 2] - rgb1[idx + 2] - meanLumShift);
+        const colorDiff = (rDiff + gDiff + bDiff) / 3;
+        if (lumDiff >= 18 || colorDiff >= 24) {
+            mask[i] = 1;
+            changedCount++;
+        }
+    }
+    const visited = new Uint8Array(total);
+    let largestClusterBlocks = 0;
+    let smallSpeckleBlocks = 0;
+    const queue = new Int32Array(total);
+    for (let i = 0; i < total; i++) {
+        if (!mask[i] || visited[i])
+            continue;
+        visited[i] = 1;
+        let head = 0;
+        let tail = 0;
+        queue[tail++] = i;
+        let clusterSize = 0;
+        while (head < tail) {
+            const curr = queue[head++];
+            clusterSize++;
+            const r = Math.floor(curr / GRID);
+            const c = curr % GRID;
+            const neighbors = [
+                r > 0 ? curr - GRID : -1,
+                r < GRID - 1 ? curr + GRID : -1,
+                c > 0 ? curr - 1 : -1,
+                c < GRID - 1 ? curr + 1 : -1,
+            ];
+            for (const nb of neighbors) {
+                if (nb >= 0 && mask[nb] && !visited[nb]) {
+                    visited[nb] = 1;
+                    queue[tail++] = nb;
+                }
+            }
+        }
+        if (clusterSize <= 2)
+            smallSpeckleBlocks += clusterSize;
+        if (clusterSize > largestClusterBlocks)
+            largestClusterBlocks = clusterSize;
+    }
+    const changedPercent = Math.round((changedCount / total) * 1000) / 10;
+    const isScatteredWeatherNoise = changedCount > 0 && largestClusterBlocks < 4 && smallSpeckleBlocks / changedCount >= 0.6;
+    const hasMeaningfulChange = largestClusterBlocks >= 3 && changedPercent >= 0.8 && !isScatteredWeatherNoise;
+    return {
+        changedPercent,
+        largestClusterBlocks,
+        isScatteredWeatherNoise,
+        hasMeaningfulChange,
+    };
+}
+const DEFAULT_SYSTEM_PROMPT = 'You are an expert home security camera vision analyst. ' +
+    'You receive camera frame(s) sampled when motion or activity was detected. ' +
+    'Analyze the frames carefully for all of the following:\n' +
+    '1. PEOPLE, MOVEMENTS & FACES: Detect any person/human, what they are doing (walking, standing, approaching door, delivering, carrying items), and locate any visible faces in "detectedFaces".\n' +
+    '2. FRAME-TO-FRAME & BASELINE CHANGES: Compare the frames (and previous baseline description if provided) for any obvious changes: a car pulling in or leaving, a vehicle replaced by a different vehicle (e.g. a black car replaced by a red car), an idle object (chair, bicycle, trash can, package) that suddenly moved or disappeared, or a person/animal suddenly appearing. Alert on any such change.\n' +
+    '3. WEATHER & IDLE FILTER: Do NOT alert ("alert": false) if NO person/animal/change is present and the motion is only rain, wind, falling leaves, swaying trees/bushes, shadows, or an unchanged parked car/chair sitting in the exact same spot.\n' +
+    '4. LICENSE PLATES & VEHICLES: Read any visible vehicle license plate characters in "licensePlates" (e.g. ["ABC-1234"]) and describe vehicles in "vehicles" (e.g. ["red SUV"]).\n' +
+    '5. COURIERS & PACKAGES vs. PERSONAL ITEMS: Identify delivery couriers by uniform, logo, or van ("Amazon", "FedEx", "UPS", "USPS", "DHL") in "deliveryCarrier". Distinguish actual delivery packages ("package" in "objects") from people carrying personal/household items such as handbags, purses, backpacks, trash bags, or groceries (list those in "carriedItems", e.g. ["backpack", "trash"], and do NOT label a handbag/backpack/trash bag as a package delivery).\n' +
+    'Reply with ONLY a valid JSON object, no markdown:\n' +
+    '{"alert": boolean, "sceneChanged": boolean, "severity": "low" | "medium" | "high", "summary": string, "save": "none" | "snapshot" | "clip" | "both", ' +
+    '"objects": string[], "licensePlates": string[], "vehicles": string[], "deliveryCarrier": string, "carriedItems": string[], ' +
+    '"detectedFaces": [{"frame": number, "box": [number, number, number, number], "sharp": boolean}], "bestFrame": number}.';
 const FACE_SIMILARITY_SYSTEM_PROMPT = 'You are a precise facial recognition scoring model. ' +
-    'You receive labeled reference face photos of enrolled people followed by 1 cropped/live camera image containing a face. ' +
+    'You receive labeled reference face photos of known people followed by 1 target camera image containing a face. ' +
     'For EACH enrolled person name, estimate a visual facial similarity score between 0.00 and 1.00 comparing the target face in the last image against that person\'s reference photo(s): ' +
     '- 0.75 to 1.00: Unmistakably the same person (clear match of facial structure, eyes, nose, hair/features).\n' +
     '- 0.50 to 0.74: Likely match, strong resemblance.\n' +
@@ -2217,11 +2444,11 @@ const FACE_SIMILARITY_SYSTEM_PROMPT = 'You are a precise facial recognition scor
     '- 0.00 to 0.24: Clearly a different person.\n' +
     'Also set "sharp": true only if the target face in the last image has clear, non-blurry facial features. ' +
     'Reply with ONLY a JSON object, no markdown: {"scores": {"<Name>": number}, "sharp": boolean}.';
-const DEFAULT_RULES = 'Alert on any person near a door, window or garage, anyone carrying or taking a package, ' +
-    'or anyone behaving suspiciously. Do not alert on people walking by on the street.';
+const DEFAULT_RULES = 'Alert on any person, animal, package delivery, moving or changed vehicle, or any obvious change in the scene. ' +
+    'Do not alert on falling leaves, wind, rain, or unmoving background objects.';
 const DEFAULT_EVIDENCE_RULES = 'Save a clip when a person is near a door, window or garage or is carrying or taking something. ' +
     'Save only a snapshot for other alerts. Save nothing for non-alerts.';
-function buildPrompt(cameraName, rules, frames, intervalSec, evidenceRules, detectorHint) {
+function buildPrompt(cameraName, rules, frames, intervalSec, evidenceRules, detectorHint, diffInfo, previousSceneSummary, hasBaselineImage = false) {
     let hintLine = '';
     if (detectorHint && (detectorHint.objects.length || detectorHint.faces.length)) {
         const parts = [];
@@ -2232,13 +2459,34 @@ function buildPrompt(cameraName, rules, frames, intervalSec, evidenceRules, dete
             parts.push(`detector_faces=[${named.join(', ')}]`);
         hintLine = `Camera smart detector reported: ${parts.join(' ')}.\n`;
     }
+    const prevLine = previousSceneSummary
+        ? `Previous scene state before this event: "${previousSceneSummary}". Compare the current view against this previous state (e.g. did a car arrive/leave, did a black car get replaced by a red car, did an idle chair/object move, or did a person appear?).\n`
+        : '';
+    const frameLine = hasBaselineImage
+        ? `Image #1 is the previous baseline frame; Image #2..#${frames} are the current live frame(s) (${intervalSec}s apart).\n`
+        : `${frames} live camera frame(s), about ${intervalSec}s apart.\n`;
+    let diffLine = '';
+    if (diffInfo) {
+        if (diffInfo.isScatteredWeatherNoise) {
+            diffLine = `Pixel comparison with previous frame: only ${diffInfo.changedPercent}% scattered speckles changed (typical of falling leaves, wind, or rain).\n`;
+        }
+        else if (!diffInfo.hasMeaningfulChange) {
+            diffLine = `Pixel comparison with previous frame: scene is nearly identical (${diffInfo.changedPercent}% diff) — ignore stationary parked cars or chairs unless a person or new object is visible.\n`;
+        }
+        else {
+            diffLine = `Pixel comparison with previous frame: ${diffInfo.changedPercent}% of the frame changed (contiguous moving/changed cluster of ${diffInfo.largestClusterBlocks} blocks) — identify what person, vehicle, color change, or object moved or appeared!\n`;
+        }
+    }
     return (`Camera: ${cameraName}\n` +
         `Trigger: ${detectorHint ? 'smart object detection' : 'motion detected'}\n` +
-        `${frames} live camera frame(s), about ${intervalSec}s apart, oldest first.\n` +
+        frameLine +
+        prevLine +
+        diffLine +
         hintLine +
         `Homeowner rules: ${rules}\n` +
         (evidenceRules ? `Evidence rules (for the "save" field): ${evidenceRules}\n` : '') +
-        'Respond with the JSON object only.');
+        'Reply with ONLY a JSON object using these exact keys:\n' +
+        '{"alert": true, "sceneChanged": true, "severity": "low" | "medium" | "high", "summary": "short description of activity, courier/items, vehicle color/plate, or changes", "save": "none" | "snapshot" | "clip" | "both", "objects": ["person"], "licensePlates": [], "vehicles": [], "deliveryCarrier": "", "carriedItems": [], "detectedFaces": [{"frame": 1, "box": [0.25, 0.1, 0.2, 0.3], "sharp": true}], "bestFrame": 1}');
 }
 function buildFaceSimilarityPrompt(faceRefs) {
     const refLabels = faceRefs.map((r, i) => `Image #${i + 1} = "${r.name}"`).join(', ');
@@ -2259,7 +2507,7 @@ async function postJson(url, headers, body, timeoutMs) {
         throw new Error(`${url} returned ${res.status}: ${(await res.text()).slice(0, 500)}`);
     return res.json();
 }
-/** Calls the selected provider and returns the model's raw text reply. */
+/** Calls the selected provider (works across all AI providers and all vision models). */
 async function callModel(cfg, req) {
     const defaults = PROVIDER_DEFAULTS[cfg.provider];
     const base = (cfg.baseUrl?.trim() || defaults.baseUrl).replace(/\/+$/, '');
@@ -2267,6 +2515,7 @@ async function callModel(cfg, req) {
     if (!base || !model)
         throw new Error(`${cfg.provider}: base URL and model are required.`);
     const b64s = req.jpegs.map(j => j.toString('base64'));
+    const combinedPrompt = `${req.system}\n\n${req.prompt}`;
     switch (cfg.provider) {
         case 'anthropic': {
             const content = b64s.map(data => ({
@@ -2300,15 +2549,19 @@ async function callModel(cfg, req) {
             const headers = {};
             if (cfg.apiKey)
                 headers.authorization = `Bearer ${cfg.apiKey}`;
-            // Stitch multi-frame / reference+target images into a single JPEG for all Ollama vision models
-            // (llava, llama3.2-vision, qwen2.5vl, gemma3, minicpm-v, etc.) to avoid multi-image context/token limits.
             let ollamaImages = b64s;
-            if (req.jpegs.length > 1) {
-                const stitched = await stitchJpegsHorizontal(req.jpegs);
-                if (stitched)
-                    ollamaImages = [stitched.toString('base64')];
+            if (req.jpegs.length > 1 && isSingleImageOnlyModel(model)) {
+                if (req.stitchForSingleImageModel) {
+                    const stitched = await stitchJpegsHorizontal(req.jpegs, 384);
+                    if (stitched)
+                        ollamaImages = [stitched.toString('base64')];
+                }
+                else {
+                    const latest = req.jpegs[req.jpegs.length - 1];
+                    ollamaImages = [latest.toString('base64')];
+                }
             }
-            const user = { role: 'user', content: req.prompt };
+            const user = { role: 'user', content: combinedPrompt };
             if (ollamaImages.length)
                 user.images = ollamaImages;
             const json = await postJson(`${base}/api/chat`, headers, {
@@ -2329,20 +2582,20 @@ async function callModel(cfg, req) {
             const headers = {};
             if (cfg.apiKey)
                 headers.authorization = `Bearer ${cfg.apiKey}`;
-            const content = [{ type: 'text', text: req.prompt }];
+            const content = [{ type: 'text', text: combinedPrompt }];
             for (const data of b64s)
                 content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${data}` } });
             const json = await postJson(`${base}/chat/completions`, headers, {
                 model,
-                max_tokens: req.maxTokens,
+                max_tokens: Math.max(req.maxTokens, 500),
                 messages: [{ role: 'system', content: req.system }, { role: 'user', content }],
             }, req.timeoutMs);
             return json.choices?.[0]?.message?.content ?? '';
         }
     }
 }
-/** Pulls the Stage 1 JSON verdict and face bounding boxes out of a model reply. */
-function parseStage1(text, cameraJpegs, upstreamObjects = []) {
+/** Pulls the Stage 1 JSON verdict, objects, license plates, couriers, and face bounding boxes out of any model's reply. */
+function parseStage1(text, cameraJpegs, upstreamObjects = [], diffInfo) {
     const match = text.match(/\{[\s\S]*\}/);
     if (!match)
         throw new Error(`Model did not return JSON: ${text.slice(0, 200)}`);
@@ -2356,9 +2609,8 @@ function parseStage1(text, cameraJpegs, upstreamObjects = []) {
             const fIdx = Math.max(0, Math.min(frameCount - 1, (Number(df.frame) || 1) - 1));
             const [imgW, imgH] = getJpegDimensions(cameraJpegs[fIdx]);
             let [bx, by, bw, bh] = df.box.map((n) => Number(n) || 0);
-            // Handle models that return 0..1000 or pixel coords instead of 0..1
             if (bw > 1.5 || bh > 1.5) {
-                if (bw <= imgW && bh <= imgH && (bx + bw <= imgW * 1.05)) {
+                if (bw <= imgW && bh <= imgH && bx + bw <= imgW * 1.05) {
                     bx /= imgW;
                     by /= imgH;
                     bw /= imgW;
@@ -2389,30 +2641,133 @@ function parseStage1(text, cameraJpegs, upstreamObjects = []) {
             });
         }
     }
-    const rawObjects = Array.isArray(parsed.objects) ? [...parsed.objects, ...upstreamObjects] : upstreamObjects;
+    let rawSummary = String(parsed.summary ?? parsed.description ?? parsed.caption ?? parsed.message ?? parsed.reason ?? parsed.activity ?? parsed.scene ?? '').trim();
+    if (!rawSummary) {
+        for (const [k, v] of Object.entries(parsed)) {
+            if (typeof v === 'string' && v.trim().length > 6 && !['severity', 'save', 'confidence', 'deliveryCarrier'].includes(k)) {
+                rawSummary = v.trim();
+                break;
+            }
+        }
+    }
+    const summary = rawSummary || 'Motion activity detected.';
+    const lowerSummary = summary.toLowerCase();
+    // Parse license plates (from parsed.licensePlates or regex in summary like "plate ABC-1234")
+    const licensePlates = [];
+    const seenPlates = new Set();
+    const addPlate = (p) => {
+        const clean = String(p ?? '').trim().toUpperCase().replace(/[^A-Z0-9\-\s]/g, '');
+        if (clean.length >= 3 && clean.length <= 12 && !['NONE', 'UNKNOWN', 'NULL', 'N/A'].includes(clean) && !seenPlates.has(clean)) {
+            seenPlates.add(clean);
+            licensePlates.push(clean);
+        }
+    };
+    if (Array.isArray(parsed.licensePlates)) {
+        for (const p of parsed.licensePlates)
+            addPlate(p);
+    }
+    else if (typeof parsed.licensePlate === 'string') {
+        addPlate(parsed.licensePlate);
+    }
+    const plateMatch = summary.match(/\b(?:license\s+plate|plate\s*(?:number|#|:)?)\s*([A-Z0-9]{2,4}[-\s]?[A-Z0-9]{2,5})\b/i);
+    if (plateMatch?.[1])
+        addPlate(plateMatch[1]);
+    // Parse vehicles descriptions
+    const vehicles = Array.isArray(parsed.vehicles)
+        ? parsed.vehicles.map((v) => String(v ?? '').trim()).filter(Boolean)
+        : [];
+    // Parse delivery carrier (DHL, Amazon, FedEx, USPS, UPS)
+    let deliveryCarrier = String(parsed.deliveryCarrier ?? '').trim();
+    if (!deliveryCarrier || /^(none|null|n\/a|unknown|false)$/i.test(deliveryCarrier)) {
+        deliveryCarrier = '';
+        for (const c of DELIVERY_CARRIERS) {
+            if (new RegExp(`\\b${c}\\b`, 'i').test(summary)) {
+                deliveryCarrier = c;
+                break;
+            }
+        }
+    }
+    // Parse carried personal/household items (handbag, purse, backpack, trash, groceries) vs delivery package
+    const carriedItems = Array.isArray(parsed.carriedItems)
+        ? parsed.carriedItems.map((x) => String(x ?? '').trim().toLowerCase()).filter(Boolean)
+        : [];
+    for (const item of ['handbag', 'purse', 'backpack', 'trash', 'trash bag', 'garbage', 'groceries', 'umbrella', 'briefcase']) {
+        if (new RegExp(`\\b${item}\\b`, 'i').test(lowerSummary) && !carriedItems.includes(item))
+            carriedItems.push(item);
+    }
+    const onlyCarryingPersonalItem = carriedItems.length > 0 &&
+        !deliveryCarrier &&
+        !/\b(package|parcel|delivery\s+box|cardboard\s+box|amazon|fedex|ups|usps|dhl)\b/.test(lowerSummary);
+    const mentionsActiveHuman = !/\b(no\s+(person|people|human|one|activity|movement)|empty|nobody|without\s+any\s+person)\b/.test(lowerSummary) &&
+        /\b(person|people|human|man|woman|boy|girl|child|adult|visitor|someone|individual|figure|courier|driver|standing|walking|approaching|running|entering|exiting|delivering|carrying)\b/.test(lowerSummary);
+    const mentionsRealActivity = mentionsActiveHuman ||
+        aiFaces.length > 0 ||
+        licensePlates.length > 0 ||
+        Boolean(deliveryCarrier) ||
+        /\b(arrived|departed|left|pulled\s+(in|up|out)|replaced|changed|driving|moving|moved|knocked|opened|closed|delivered|dropped\s+off|picked\s+up|dog|cat|animal|pet|deer|package|parcel|activity\s+detected)\b/.test(lowerSummary);
+    const mentionsWeatherOnly = !mentionsRealActivity &&
+        /\b(only\s+(falling\s+lea(f|ves)|wind|rain|snow|shadows?|trees?)|caused\s+by\s+(wind|rain|leaves|shadows?)|falling\s+lea(f|ves)|lea(f|ves)\s+(blowing|falling)|swaying\s+(tree|branch|bush|plant)|rain(ing|drops)?\s+only)\b/.test(lowerSummary);
+    const hasLargePixelChange = !!diffInfo && diffInfo.hasMeaningfulChange && diffInfo.changedPercent >= 5.0 && diffInfo.largestClusterBlocks >= 6;
+    const mentionsIdleOnly = !mentionsRealActivity &&
+        !hasLargePixelChange &&
+        /\b(no\s+(significant\s+)?(change|movement|activity|motion|difference)\s+detected|scene\s+is\s+unchanged|nothing\s+(changed|moved|new)|(parked|stationary|idle|unmoving)\s+(car|vehicle|truck|suv|van|chair|furniture|bicycle|bike|object)s?\s+(only|with\s+no|and\s+no)|empty\s+(porch|driveway|yard|scene|walkway|street))\b/.test(lowerSummary);
+    let rawObjects = Array.isArray(parsed.objects) ? [...parsed.objects, ...upstreamObjects] : [...upstreamObjects];
+    if (mentionsActiveHuman || deliveryCarrier)
+        rawObjects.push('person');
+    if (deliveryCarrier)
+        rawObjects.push('package');
+    if (licensePlates.length > 0 || vehicles.length > 0)
+        rawObjects.push('vehicle');
+    // If person is only carrying a handbag/backpack/trash (not a package), remove accidental 'package' tag
+    if (onlyCarryingPersonalItem)
+        rawObjects = rawObjects.filter(o => !['package', 'parcel', 'box'].includes(String(o).toLowerCase()));
+    if (mentionsIdleOnly || mentionsWeatherOnly) {
+        rawObjects = [];
+    }
+    else {
+        if (/\b(car|truck|vehicle|van|suv|sedan|pickup|motorcycle|bicycle|bike)\b/.test(lowerSummary) &&
+            (!/\b(parked|stationary|idle|unchanged)\b/.test(lowerSummary) ||
+                /\b(arrived|left|moved|pulled|driving|replaced|different)\b/.test(lowerSummary))) {
+            rawObjects.push('vehicle');
+        }
+        if (!onlyCarryingPersonalItem && /\b(package|parcel|delivery|cardboard\s+box)\b/.test(lowerSummary))
+            rawObjects.push('package');
+        if (/\b(dog|cat|animal|pet|deer|wildlife|raccoon|fox|coyote|bear)\b/.test(lowerSummary))
+            rawObjects.push('animal');
+    }
     const objects = normalizeObjects(rawObjects, aiFaces.length > 0);
     const rawBest = Number(parsed.bestFrame);
     const bestFrameIndex = Number.isFinite(rawBest) && rawBest >= 1 && rawBest <= frameCount
         ? Math.round(rawBest) - 1
         : Math.floor(frameCount / 2);
-    // Fallback for vision models like llava that report a person/face without returning bounding box coordinates
-    if (aiFaces.length === 0 && (objects.includes('person') || objects.includes('face') || parsed.sharp === true)) {
+    if (aiFaces.length === 0 && objects.includes('person')) {
         const [imgW, imgH] = getJpegDimensions(cameraJpegs[bestFrameIndex] ?? cameraJpegs[0]);
         aiFaces.push({
             frameIndex: bestFrameIndex,
-            box: [0.25, 0.08, 0.5, 0.55],
+            box: [0.25, 0.08, 0.5, 0.5],
             widthPx: Math.round(imgW * 0.25),
             heightPx: Math.round(imgH * 0.35),
-            sharp: parsed.sharp !== false,
+            sharp: true,
             sharpnessScore: 20,
         });
     }
+    const hasNotableObject = objects.length > 0;
+    const weatherOrIdleOnly = (mentionsWeatherOnly || mentionsIdleOnly) && !mentionsRealActivity && !hasNotableObject && !hasLargePixelChange;
+    const sceneChanged = !weatherOrIdleOnly;
+    const rawAlert = parsed.alert === true || parsed.alert === 'true';
+    const shouldAlert = (rawAlert || mentionsRealActivity || hasNotableObject || hasLargePixelChange) && !weatherOrIdleOnly;
     return {
-        alert: parsed.alert === true || parsed.alert === 'true',
+        alert: shouldAlert,
+        sceneChanged,
+        weatherOrIdleOnly,
         severity: ['low', 'medium', 'high'].includes(parsed.severity) ? parsed.severity : 'medium',
-        summary: String(parsed.summary ?? '').trim() || 'Activity detected.',
+        summary: hasLargePixelChange && /no\s+change\s+detected/i.test(summary) ? 'Significant scene change detected in camera view.' : summary,
         save: ['none', 'snapshot', 'clip', 'both'].includes(parsed.save) ? parsed.save : 'none',
         objects,
+        licensePlates,
+        vehicles,
+        deliveryCarrier: deliveryCarrier || undefined,
+        carriedItems,
         aiFaces,
         bestFrameIndex,
     };
@@ -2447,12 +2802,16 @@ async function sampleFrames(ffmpegPath, inputArgs, count, intervalSec, log) {
         const args = [
             '-nostdin',
             '-hide_banner',
-            '-loglevel', 'error',
+            '-loglevel',
+            'error',
             ...inputArgs,
             '-an',
-            '-vf', `fps=1/${intervalSec},scale=min(1024\\,iw):-2`,
-            '-frames:v', String(count),
-            '-q:v', '5',
+            '-vf',
+            `fps=1/${intervalSec},scale=min(1024\\,iw):-2`,
+            '-frames:v',
+            String(count),
+            '-q:v',
+            '5',
             path__namespace.join(dir, 'frame_%02d.jpg'),
         ];
         const killAfterMs = (count * intervalSec + 20) * 1000;
@@ -2501,11 +2860,16 @@ async function normalizeReferenceJpeg(raw, extHint = '.jpg') {
                 const p = child_process.spawn(ffmpegPath, [
                     '-nostdin',
                     '-hide_banner',
-                    '-loglevel', 'error',
-                    '-i', inFile,
-                    '-frames:v', '1',
-                    '-vf', 'scale=min(512\\,iw):-2',
-                    '-q:v', '5',
+                    '-loglevel',
+                    'error',
+                    '-i',
+                    inFile,
+                    '-frames:v',
+                    '1',
+                    '-vf',
+                    'scale=min(512\\,iw):-2',
+                    '-q:v',
+                    '5',
                     outFile,
                 ], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
                 const timer = setTimeout(() => p.kill('SIGKILL'), 10000);
@@ -2538,11 +2902,8 @@ function personNameFromFilename(file) {
         .replace(/[_]+/g, ' ')
         .trim();
 }
-/**
- * Stitches multiple JPEGs side-by-side into a single composite JPEG using Scrypted's ffmpeg.
- * Used for Ollama models like `llava` that only support a single image per request and to minimize vision tokens.
- */
-async function stitchJpegsHorizontal(jpegs) {
+/** Stitches multiple JPEGs side-by-side into a single composite JPEG using Scrypted's ffmpeg. */
+async function stitchJpegsHorizontal(jpegs, heightPx = 384) {
     if (jpegs.length <= 1)
         return jpegs[0];
     try {
@@ -2556,7 +2917,7 @@ async function stitchJpegsHorizontal(jpegs) {
                 inputArgs.push('-i', p);
             }
             const n = jpegs.length;
-            const scaleParts = jpegs.map((_, i) => `[${i}:v]scale=-2:384[v${i}]`).join(';');
+            const scaleParts = jpegs.map((_, i) => `[${i}:v]scale=-2:${heightPx}[v${i}]`).join(';');
             const stackInputs = jpegs.map((_, i) => `[v${i}]`).join('');
             const filterComplex = `${scaleParts};${stackInputs}hstack=inputs=${n}[out]`;
             const outFile = path__namespace.join(dir, 'stitched.jpg');
@@ -2564,12 +2925,17 @@ async function stitchJpegsHorizontal(jpegs) {
                 const proc = child_process.spawn(ffmpegPath, [
                     '-nostdin',
                     '-hide_banner',
-                    '-loglevel', 'error',
+                    '-loglevel',
+                    'error',
                     ...inputArgs,
-                    '-filter_complex', filterComplex,
-                    '-map', '[out]',
-                    '-frames:v', '1',
-                    '-q:v', '5',
+                    '-filter_complex',
+                    filterComplex,
+                    '-map',
+                    '[out]',
+                    '-frames:v',
+                    '1',
+                    '-q:v',
+                    '5',
                     outFile,
                 ], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
                 const timer = setTimeout(() => proc.kill('SIGKILL'), 10000);
@@ -2593,9 +2959,9 @@ async function stitchJpegsHorizontal(jpegs) {
     }
 }
 /* ------------------------------------------------------------------ */
-/* Notification helpers                                                 */
+/* Notification & Storage helpers                                       */
 /* ------------------------------------------------------------------ */
-const CHANNELS = ['Home Assistant', 'ntfy', 'Pushover', 'Telegram'];
+const CHANNELS = ['Home Assistant', 'Webhook', 'ntfy', 'Pushover', 'Telegram'];
 function errMsg(e) {
     return e instanceof Error ? e.message : String(e);
 }
@@ -2631,6 +2997,10 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
     lastDetectionId;
     lastDetectionJpeg;
     pendingHint;
+    /** Previous analysis baseline frame & summary used to detect if cars, chairs, or background changed */
+    lastBaselineJpeg;
+    lastBaselineTime = 0;
+    lastBaselineSummary = '';
     /** Multi-frame confirmation state within 30s window, keyed by person name or 'stranger:<id>' */
     pendingConfirmations = new Map();
     /** Cooldown timestamps per known person name (lowercase) */
@@ -2646,27 +3016,58 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         },
         triggerSource: {
             title: 'Trigger source',
-            description: 'Smart Object/Face Detection avoids false motion triggers (trees, shadows, headlights). ' +
-                'Automatically falls back to Motion if this camera does not have a smart detector.',
+            description: 'When to run AI analysis: on Motion events, Scrypted smart ObjectDetector events, or both (recommended).',
             type: 'string',
             choices: TRIGGER_CHOICES,
             defaultValue: TRIGGER_CHOICES[0],
         },
+        /* ---------------- On / Off Switches for People, Animals, Vehicles, Packages ---------------- */
+        detectPeople: {
+            title: 'Detect & alert on People',
+            description: 'Switch On/Off alerts for people (known faces, strangers, couriers, visitors).',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        detectVehicles: {
+            title: 'Detect & alert on Vehicles & License Plates',
+            description: 'Switch On/Off alerts for arriving/departing/changed vehicles and license plates.',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        detectPackages: {
+            title: 'Detect & alert on Packages & Couriers',
+            description: 'Switch On/Off alerts for packages and DHL, Amazon, FedEx, USPS, UPS deliveries.',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        detectAnimals: {
+            title: 'Detect & alert on Animals',
+            description: 'Switch On/Off alerts for pets and wildlife (dogs, cats, deer, etc.).',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        ignoreStationaryAndWeather: {
+            title: 'Ignore idle objects (parked cars, chairs) & weather (leaves, wind, rain)',
+            description: 'Compares the previous baseline frame against the current frame. Suppresses false alarms from falling leaves, wind, or rain, ' +
+                'while alerting whenever a car arrives/leaves, a black car is replaced by a red car, an idle object moves, or a person appears.',
+            type: 'boolean',
+            defaultValue: true,
+        },
         minDetectorScore: {
             title: 'Minimum smart detector confidence (0.1 - 0.95)',
-            description: 'Ignores low-confidence Scrypted ObjectDetector triggers to save AI tokens.',
+            description: 'Minimum confidence for Scrypted ObjectDetector triggers.',
             type: 'number',
-            defaultValue: 0.6,
+            defaultValue: 0.5,
         },
         motionDelaySeconds: {
             title: 'Motion settle delay (seconds)',
-            description: 'When triggered by a raw motion sensor, waits briefly before sampling so the person/object is fully in frame.',
+            description: 'Brief pause after motion starts so the person/object is in frame before sampling.',
             type: 'number',
-            defaultValue: 1.5,
+            defaultValue: 0.5,
         },
         frameCount: {
             title: 'Frames to analyze',
-            description: 'Frames sampled from the live stream after motion starts. More frames give better context but cost more.',
+            description: 'Frames sampled from the live stream after motion starts. More frames give better movement context.',
             type: 'number',
             defaultValue: 3,
         },
@@ -2688,8 +3089,8 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
             defaultValue: DEFAULT_RULES,
         },
         objectFilter: {
-            title: 'Required object types (optional)',
-            description: 'Only send an alert if at least one of these object categories is detected. Leave empty to allow any alert.',
+            title: 'Additional required object filter (optional)',
+            description: 'Leave empty to use the People / Vehicles / Packages / Animals On/Off switches above.',
             type: 'string',
             multiple: true,
             choices: OBJECT_FILTER_CHOICES,
@@ -2697,15 +3098,14 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         },
         faceAlertMode: {
             title: 'Face recognition behavior',
-            description: 'Sends "<Name> arrived" alerts for confirmed known people (unless listed in "Never notify for these names" on the plugin page) ' +
-                'and tracks strangers across frames with quality gates.',
+            description: 'Distinguishes recognized known faces from non-recognized stranger faces and alerts on their movements and activity.',
             type: 'string',
             choices: FACE_ALERT_MODES,
             defaultValue: FACE_ALERT_MODES[0],
         },
         emitObjectDetections: {
             title: 'Emit Scrypted ObjectDetector events',
-            description: 'Publishes AI-detected objects (person, vehicle, package, animal) and confirmed face labels back to Scrypted.',
+            description: 'Publishes AI-detected objects (person, vehicle, package, animal), license plates, and face labels back to Scrypted.',
             type: 'boolean',
             defaultValue: true,
         },
@@ -2717,7 +3117,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         },
         channels: {
             title: 'Send alerts to',
-            description: 'Phone/app channels configured on the AI Vision Alerts plugin page. ' +
+            description: 'Channels configured on the AI Vision Alerts plugin page (Home Assistant, Webhook, ntfy, Pushover, Telegram). ' +
                 'Leave empty to use every channel that is configured.',
             type: 'string',
             multiple: true,
@@ -2727,7 +3127,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         haCameraEntity: {
             title: 'Home Assistant camera entity (optional)',
             description: 'e.g. camera.front_door. If this camera also exists in Home Assistant, the phone notification ' +
-                'will include a camera snapshot. Leave blank for text only.',
+                'will include a camera snapshot.',
         },
         notifiers: {
             title: 'Also send to Scrypted notifiers (optional)',
@@ -2737,7 +3137,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         },
         attachSnapshot: {
             title: 'Attach a frame to notifications',
-            description: 'Applies to ntfy, Pushover, Telegram and Scrypted notifiers. Home Assistant uses the camera entity above.',
+            description: 'Applies to Home Assistant, Webhook, ntfy, Pushover, Telegram and Scrypted notifiers.',
             type: 'boolean',
             defaultValue: true,
         },
@@ -2757,7 +3157,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         },
         analyzeNow: {
             title: 'Analyze now (test)',
-            description: 'Samples the live stream, asks the AI, and sends a notification regardless of the verdict.',
+            description: 'Samples the live stream, asks the AI, saves the snapshot, and sends a notification.',
             type: 'button',
             onPut: async () => {
                 await this.analyze(true, undefined, false);
@@ -2775,9 +3175,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 const trig = String(this.storageSettings.values.triggerSource ?? TRIGGER_CHOICES[0]);
                 if (trig === 'Smart Object/Face Detection only')
                     return;
-                if (trig.startsWith('Smart Object/Face Detection (fallback') && hasObjectDetector)
-                    return;
-                const delayMs = Math.min(10, Math.max(0, Number(this.storageSettings.values.motionDelaySeconds ?? 1.5))) * 1000;
+                const delayMs = Math.min(10, Math.max(0, Number(this.storageSettings.values.motionDelaySeconds ?? 0.5))) * 1000;
                 if (this.motionTimer)
                     return;
                 this.motionTimer = setTimeout(() => {
@@ -2809,14 +3207,22 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
     onObjectsDetected(data) {
         if (!data || data.sourceId === 'ai-vision-alerts' || data.detectionId?.startsWith('ai-vision-alerts-'))
             return;
-        const minScore = Math.min(0.95, Math.max(0.1, Number(this.storageSettings.values.minDetectorScore ?? 0.6)));
+        const trig = String(this.storageSettings.values.triggerSource ?? TRIGGER_CHOICES[0]);
+        if (trig === 'Motion sensor only')
+            return;
+        const minScore = Math.min(0.95, Math.max(0.1, Number(this.storageSettings.values.minDetectorScore ?? 0.5)));
         const detections = data.detections ?? [];
         const rawClasses = [];
         const faceCandidates = [];
         const [dimW, dimH] = data.inputDimensions ?? [1024, 576];
+        let sawMotionDetection = false;
         for (const d of detections) {
-            if (!d.className || d.className === 'motion')
+            if (!d.className)
                 continue;
+            if (d.className === 'motion') {
+                sawMotionDetection = true;
+                continue;
+            }
             if (typeof d.score === 'number' && d.score < minScore)
                 continue;
             let normBox = [0.25, 0.15, 0.25, 0.35];
@@ -2828,7 +3234,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 const normY = dimH > 1.5 ? by / dimH : by;
                 const normW = dimW > 1.5 ? bw / dimW : bw;
                 const normH = dimH > 1.5 ? bh / dimH : bh;
-                if (normW > 0 && normH > 0 && normW * normH < 0.01)
+                if (normW > 0 && normH > 0 && normW * normH < 0.005)
                     continue;
                 normBox = [
                     Math.max(0, Math.min(1, normX)),
@@ -2855,17 +3261,18 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
             }
         }
         const objects = normalizeObjects(rawClasses, faceCandidates.length > 0);
-        if (!objects.length && !faceCandidates.length)
+        if (!objects.length && !faceCandidates.length) {
+            if (sawMotionDetection && trig !== 'Smart Object/Face Detection only') {
+                this.analyze(false).catch(e => this.console.error('analyze failed', e));
+            }
             return;
+        }
         this.pendingHint = {
             objects,
             faces: faceCandidates,
             detectionId: data.detectionId,
             timestamp: Date.now(),
         };
-        const trig = String(this.storageSettings.values.triggerSource ?? TRIGGER_CHOICES[0]);
-        if (trig === 'Motion sensor only')
-            return;
         this.analyze(false, this.pendingHint).catch(e => this.console.error('analyze failed', e));
     }
     getMixinSettings() {
@@ -2876,7 +3283,20 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
     }
     /* ---------------- Scrypted ObjectDetector interface ---------------- */
     async getObjectTypes() {
-        const classes = new Set(['person', 'face', 'vehicle', 'car', 'truck', 'bicycle', 'motorcycle', 'package', 'animal', 'dog', 'cat']);
+        const classes = new Set([
+            'person',
+            'face',
+            'vehicle',
+            'car',
+            'truck',
+            'bicycle',
+            'motorcycle',
+            'package',
+            'animal',
+            'dog',
+            'cat',
+            'plate',
+        ]);
         if (this.mixinDeviceInterfaces.includes(srcExports.ScryptedInterface.ObjectDetector) && this.mixinDevice.getObjectTypes) {
             try {
                 const upstream = await this.mixinDevice.getObjectTypes();
@@ -2903,7 +3323,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
     async emitDetections(verdict, representativeJpeg) {
         if (!this.storageSettings.values.emitObjectDetections)
             return;
-        if (!verdict.objects.length && !verdict.faces.length)
+        if (!verdict.objects.length && !verdict.faces.length && !verdict.licensePlates.length)
             return;
         const detectionId = `ai-vision-alerts-${Date.now()}`;
         this.lastDetectionId = detectionId;
@@ -2926,6 +3346,15 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 label: face,
                 score: 0.9,
                 labelScore: 0.9,
+                boundingBox: [0, 0, 1, 1],
+            });
+        }
+        for (const plate of verdict.licensePlates) {
+            detections.push({
+                className: 'plate',
+                label: plate,
+                score: 0.95,
+                labelScore: 0.95,
                 boundingBox: [0, 0, 1, 1],
             });
         }
@@ -3001,7 +3430,8 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
             }
             try {
                 const text = await callModel(cfg, request);
-                return { text, used: cfg.provider };
+                const model = cfg.model?.trim() || PROVIDER_DEFAULTS[cfg.provider].model;
+                return { text, used: cfg.provider, model };
             }
             catch (e) {
                 lastError = e;
@@ -3014,14 +3444,12 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
     matchOrCreateStrangerCluster(embedding) {
         const now = Date.now();
         const cooldownMs = this.provider.strangerCooldownMs();
-        // Prune expired stranger clusters older than max(cooldownMs, 30 min)
         this.strangerClusters = this.strangerClusters.filter(c => now - c.lastSeen < Math.max(cooldownMs, 30 * 60 * 1000));
         let bestCluster;
         let bestSim = 0;
         for (const cluster of this.strangerClusters) {
             if (embedding && cluster.embedding) {
                 const sim = cosineSimilarity(embedding, cluster.embedding);
-                // Same stranger appearance within session or recent frames
                 const threshold = now - cluster.lastSeen < 45000 ? 0.62 : 0.74;
                 if (sim >= threshold && sim > bestSim) {
                     bestSim = sim;
@@ -3029,7 +3457,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 }
             }
             else if (now - cluster.lastSeen < 35000) {
-                // Within the active 30s confirmation window on the same camera without embedding
                 bestCluster = cluster;
                 break;
             }
@@ -3037,7 +3464,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         if (bestCluster) {
             bestCluster.lastSeen = now;
             if (embedding && bestCluster.embedding) {
-                // Exponential moving average of appearance embedding
                 const blended = bestCluster.embedding.map((v, i) => 0.7 * v + 0.3 * embedding[i]);
                 bestCluster.embedding = l2Normalize(blended);
             }
@@ -3067,26 +3493,22 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         const minUnknownWidth = this.provider.minUnknownFaceWidthPx(); // default 80 px
         const matchThreshold = this.provider.matchThreshold(); // default 0.5
         const lookAlikeMargin = this.provider.lookAlikeMargin(); // default 0.06
-        // Enrich candidates with real pixel sharpness & patch embedding via ffmpeg
         for (const c of candidates) {
             const frame = cameraJpegs[c.frameIndex] ?? cameraJpegs[0];
             const patch = await analyzeFacePatch(ffmpegPath, frame, c.box);
             if (patch) {
                 c.sharpnessScore = patch.sharpnessScore;
-                // Must pass both AI sharpness check and Laplacian pixel sharpness (>= 14)
                 c.sharp = c.sharp && patch.sharpnessScore >= 14;
                 if (!c.embedding)
                     c.embedding = patch.embedding;
             }
         }
-        // Group candidates by frame or pick best candidate per frame so we know how many frames saw each face
         const results = [];
-        // If we have at least one candidate >= minKnownWidth and faceRefs exist, query AI similarity once for the sharpest/largest frame
         let aiScoresByPerson = new Map();
         let aiSharpOverride;
         const viableForAi = candidates
             .filter(c => c.widthPx >= minKnownWidth)
-            .sort((a, b) => (Number(b.sharp) - Number(a.sharp)) || (b.widthPx - a.widthPx));
+            .sort((a, b) => Number(b.sharp) - Number(a.sharp) || b.widthPx - a.widthPx);
         if (viableForAi.length > 0 && faceRefs.length > 0) {
             try {
                 const bestCand = viableForAi[0];
@@ -3097,6 +3519,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     jpegs: [...faceRefs.map(r => r.jpeg), bestJpeg],
                     maxTokens: 150,
                     timeoutMs: this.provider.timeoutMs(),
+                    stitchForSingleImageModel: true,
                 };
                 const { text: simText } = await this.runWithProviderChain(chain, simReq);
                 const parsedSim = parseFaceSimilarityReply(simText);
@@ -3107,7 +3530,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 this.console.warn('Face similarity scoring failed:', errMsg(e));
             }
         }
-        // Group enrolled references by person name
         const refsByPerson = new Map();
         for (const r of faceRefs) {
             const list = refsByPerson.get(r.name) ?? [];
@@ -3116,7 +3538,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         }
         for (const cand of candidates) {
             const effectiveSharp = aiSharpOverride === false ? false : cand.sharp;
-            // Compute similarity score for each enrolled person (combining AI score, upstream detector score, and patch cosine similarity)
             const personScores = [];
             for (const [personName, refs] of refsByPerson.entries()) {
                 let aiScore = 0;
@@ -3134,7 +3555,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 let upstreamSim = 0;
                 if (cand.upstreamLabel && cand.upstreamLabel.toLowerCase() === personName.toLowerCase())
                     upstreamSim = cand.upstreamScore ?? 0.75;
-                // Combine available signals into a calibrated 0.00..1.00 similarity score
                 let combined = aiScore;
                 if (upstreamSim > 0 && aiScore > 0)
                     combined = 0.65 * aiScore + 0.35 * upstreamSim;
@@ -3154,7 +3574,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
             const runnerUpSimilarity = runnerUp?.score ?? 0;
             const runnerUpName = runnerUp?.name;
             const margin = Math.round((bestSimilarity - runnerUpSimilarity) * 100) / 100;
-            // 1. Minimum face width gate for any face (default 64 px)
             if (cand.widthPx < minKnownWidth) {
                 results.push({
                     status: 'rejected',
@@ -3167,12 +3586,12 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     sharp: effectiveSharp,
                     sharpnessScore: cand.sharpnessScore,
                     frameIndex: cand.frameIndex,
+                    box: cand.box,
                     embedding: cand.embedding,
                     rejectReason: `${cand.widthPx}px < ${minKnownWidth}px min width`,
                 });
                 continue;
             }
-            // 2. Check if it meets known match threshold (default 0.5) and look-alike margin (default 0.06)
             if (bestMatchName && bestSimilarity >= matchThreshold) {
                 if (runnerUp && margin < lookAlikeMargin) {
                     results.push({
@@ -3186,6 +3605,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                         sharp: effectiveSharp,
                         sharpnessScore: cand.sharpnessScore,
                         frameIndex: cand.frameIndex,
+                        box: cand.box,
                         embedding: cand.embedding,
                         rejectReason: `margin ${margin.toFixed(2)} < ${lookAlikeMargin} (${bestMatchName} ${bestSimilarity.toFixed(2)} vs ${runnerUpName} ${runnerUpSimilarity.toFixed(2)})`,
                     });
@@ -3203,6 +3623,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                         sharp: false,
                         sharpnessScore: cand.sharpnessScore,
                         frameIndex: cand.frameIndex,
+                        box: cand.box,
                         embedding: cand.embedding,
                         rejectReason: `blurry (sharpness ${cand.sharpnessScore})`,
                     });
@@ -3219,11 +3640,11 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     sharp: true,
                     sharpnessScore: cand.sharpnessScore,
                     frameIndex: cand.frameIndex,
+                    box: cand.box,
                     embedding: cand.embedding,
                 });
                 continue;
             }
-            // 3. Unmatched face quality gates: must be at least 80 px wide AND sharp before it counts as "unknown"
             if (cand.widthPx < minUnknownWidth) {
                 results.push({
                     status: 'rejected',
@@ -3236,6 +3657,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     sharp: effectiveSharp,
                     sharpnessScore: cand.sharpnessScore,
                     frameIndex: cand.frameIndex,
+                    box: cand.box,
                     embedding: cand.embedding,
                     rejectReason: `unmatched face ${cand.widthPx}px < ${minUnknownWidth}px unknown gate`,
                 });
@@ -3253,6 +3675,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     sharp: false,
                     sharpnessScore: cand.sharpnessScore,
                     frameIndex: cand.frameIndex,
+                    box: cand.box,
                     embedding: cand.embedding,
                     rejectReason: `unmatched face blurry (sharpness ${cand.sharpnessScore})`,
                 });
@@ -3269,6 +3692,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 sharp: true,
                 sharpnessScore: cand.sharpnessScore,
                 frameIndex: cand.frameIndex,
+                box: cand.box,
                 embedding: cand.embedding,
             });
         }
@@ -3279,7 +3703,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
         if (this.recheckTimer)
             return;
         const now = Date.now();
-        const windowMs = this.provider.confirmationWindowMs(); // 30s
+        const windowMs = this.provider.confirmationWindowMs();
         let hasActivePending = false;
         for (const [k, p] of this.pendingConfirmations.entries()) {
             if (now - p.firstSeen > windowMs) {
@@ -3295,6 +3719,30 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
             this.recheckTimer = undefined;
             this.analyze(false, undefined, true).catch(e => this.console.error('confirmation re-check failed', e));
         }, 3000);
+    }
+    /** Checks if any detected object category is enabled via the People / Animals / Vehicles / Packages switches. */
+    passesCategorySwitches(objects, hasConfirmedFace, hasUnrecognizedPerson) {
+        const s = this.storageSettings.values;
+        const peopleOn = Boolean(s.detectPeople ?? true);
+        const vehiclesOn = Boolean(s.detectVehicles ?? true);
+        const packagesOn = Boolean(s.detectPackages ?? true);
+        const animalsOn = Boolean(s.detectAnimals ?? true);
+        const hasPerson = objects.includes('person') || objects.includes('face') || hasConfirmedFace || hasUnrecognizedPerson;
+        const hasVehicle = objects.includes('vehicle');
+        const hasPackage = objects.includes('package');
+        const hasAnimal = objects.includes('animal');
+        // If none of the 4 categories were specifically tagged, allow general scene change alerts if any switch is on
+        if (!hasPerson && !hasVehicle && !hasPackage && !hasAnimal)
+            return peopleOn || vehiclesOn || packagesOn || animalsOn;
+        if (hasPerson && peopleOn)
+            return true;
+        if (hasVehicle && vehiclesOn)
+            return true;
+        if (hasPackage && packagesOn)
+            return true;
+        if (hasAnimal && animalsOn)
+            return true;
+        return false;
     }
     async analyze(force, triggerHint, isConfirmationRecheck = false) {
         const s = this.storageSettings.values;
@@ -3317,7 +3765,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
             this.lastRun = now;
         try {
             const cameraName = systemManager$1.getDeviceById(this.id)?.name ?? 'Camera';
-            // During a 3-second confirmation re-check, sample 1 quick frame to confirm the face fast and save tokens
             const count = isConfirmationRecheck
                 ? 1
                 : Math.min(8, Math.max(1, Math.round(Number(s.frameCount ?? 3))));
@@ -3326,34 +3773,58 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 (this.pendingHint && Date.now() - this.pendingHint.timestamp < 15000 ? this.pendingHint : undefined);
             this.pendingHint = undefined;
             const cameraJpegs = await this.captureFrames(count, interval, activeHint?.detectionId);
-            // Stage 1: Analyze scene & locate faces
+            const ignoreIdleAndWeather = Boolean(s.ignoreStationaryAndWeather ?? true);
+            const hasPrevBaseline = ignoreIdleAndWeather &&
+                !isConfirmationRecheck &&
+                !!this.lastBaselineJpeg &&
+                now - this.lastBaselineTime < 6 * 60 * 60 * 1000;
+            const prevRefJpeg = hasPrevBaseline ? this.lastBaselineJpeg : cameraJpegs[0];
+            const latestJpeg = cameraJpegs[cameraJpegs.length - 1];
+            let diffInfo;
+            if (ignoreIdleAndWeather && (hasPrevBaseline || cameraJpegs.length > 1)) {
+                try {
+                    const ffmpegPath = await mediaManager$1.getFFmpegPath();
+                    diffInfo = await computeFrameChange(ffmpegPath, prevRefJpeg, latestJpeg);
+                }
+                catch {
+                    // optional
+                }
+            }
+            // For multi-image capable models, include the previous baseline frame as Image #1 so the AI can visually spot
+            // cars arriving/leaving, a black car replaced by a red car, or idle objects moving.
+            // (Single-image models like llava automatically receive only the latest frame inside callModel.)
+            const primaryModel = chain[0]?.model?.trim() || PROVIDER_DEFAULTS[chain[0].provider].model;
+            const includeBaselineImage = hasPrevBaseline && !isSingleImageOnlyModel(primaryModel);
+            const stage1Frames = includeBaselineImage ? [this.lastBaselineJpeg, ...cameraJpegs] : cameraJpegs;
             const started = Date.now();
             const stage1Req = {
                 system: DEFAULT_SYSTEM_PROMPT,
-                prompt: buildPrompt(cameraName, s.rules || DEFAULT_RULES, cameraJpegs.length, interval, String(s.saveEvidence ?? '').startsWith('Let the AI')
+                prompt: buildPrompt(cameraName, s.rules || DEFAULT_RULES, stage1Frames.length, interval, String(s.saveEvidence ?? '').startsWith('Let the AI')
                     ? s.evidenceRules || DEFAULT_EVIDENCE_RULES
-                    : undefined, activeHint),
-                jpegs: cameraJpegs,
-                maxTokens: 350,
+                    : undefined, activeHint, diffInfo, hasPrevBaseline ? this.lastBaselineSummary : undefined, includeBaselineImage),
+                jpegs: stage1Frames,
+                maxTokens: 450,
                 timeoutMs: this.provider.timeoutMs(),
             };
             const { text, used } = await this.runWithProviderChain(chain, stage1Req);
-            const stage1 = parseStage1(text, cameraJpegs, activeHint?.objects ?? []);
-            // Combine upstream Scrypted detector face candidates with AI-located face boxes
+            const stage1 = parseStage1(text, cameraJpegs, activeHint?.objects ?? [], diffInfo);
+            const bestFrame = cameraJpegs[stage1.bestFrameIndex] ?? latestJpeg;
+            if (!isConfirmationRecheck) {
+                this.lastBaselineJpeg = bestFrame;
+                this.lastBaselineTime = now;
+                this.lastBaselineSummary = stage1.summary;
+            }
             const allCandidates = [...(activeHint?.faces ?? []), ...stage1.aiFaces];
             const evaluatedFaces = await this.evaluateFaces(allCandidates, cameraJpegs, chain);
-            // Process multi-frame confirmations (2 frames in 30s for known, 3 frames in 30s for stranger)
             const windowMs = this.provider.confirmationWindowMs(); // 30s
             const knownReqFrames = this.provider.knownConfirmFrames(); // default 2
             const strangerReqFrames = this.provider.strangerConfirmFrames(); // default 3
             const knownCooldownMs = this.provider.knownCooldownMs(); // default 2 min
             const strangerCooldownMs = this.provider.strangerCooldownMs(); // default 15 min
-            // Prune expired pending confirmations (> 30s old)
             for (const [k, p] of this.pendingConfirmations.entries()) {
                 if (now - p.firstSeen > windowMs)
                     this.pendingConfirmations.delete(k);
             }
-            // Deduplicate evaluations per frame so 1 frame = at most +1 confirmation count per person/stranger
             const seenInFramesByKey = new Map();
             for (const ef of evaluatedFaces) {
                 if (ef.status === 'known') {
@@ -3369,7 +3840,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     }
                 }
                 else if (ef.status === 'unknown') {
-                    // Group the same stranger across frames into one cluster
                     const cluster = this.matchOrCreateStrangerCluster(ef.embedding);
                     const key = `stranger:${cluster.id}`;
                     const existing = seenInFramesByKey.get(key);
@@ -3383,7 +3853,6 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     }
                 }
                 else {
-                    // Record rejected / ambiguous faces in the Recent recognitions panel for tuning!
                     this.provider.recordRecognition(cameraName, ef, 0, 0, ef.rejectReason ?? ef.status);
                 }
             }
@@ -3395,13 +3864,13 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 const isStranger = evalFace.status === 'unknown';
                 const reqFrames = isStranger ? strangerReqFrames : knownReqFrames;
                 const frameDelta = frames.size;
-                const bestJpeg = cameraJpegs[evalFace.frameIndex] ?? cameraJpegs[stage1.bestFrameIndex] ?? cameraJpegs[0];
+                const bestJpeg = cameraJpegs[evalFace.frameIndex] ?? bestFrame;
                 let pending = this.pendingConfirmations.get(key);
                 if (!pending || now - pending.firstSeen > windowMs) {
                     pending = {
                         key,
                         isStranger,
-                        displayName: isStranger ? `unknown (stranger #${cluster.id})` : evalFace.name,
+                        displayName: isStranger ? `Stranger #${cluster.id}` : evalFace.name,
                         framesSeen: frameDelta,
                         requiredFrames: reqFrames,
                         firstSeen: now,
@@ -3410,6 +3879,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                         closestName: evalFace.bestMatchName,
                         widthPx: evalFace.widthPx,
                         bestJpeg,
+                        faceBox: evalFace.box,
                         summary: stage1.summary,
                         severity: stage1.severity,
                         objects: stage1.objects,
@@ -3421,6 +3891,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 else {
                     pending.framesSeen += frameDelta;
                     pending.lastSeen = now;
+                    pending.summary = stage1.summary;
                     if (evalFace.bestSimilarity > pending.bestSimilarity) {
                         pending.bestSimilarity = evalFace.bestSimilarity;
                         pending.closestName = evalFace.bestMatchName;
@@ -3428,6 +3899,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                     if (evalFace.widthPx > pending.widthPx) {
                         pending.widthPx = evalFace.widthPx;
                         pending.bestJpeg = bestJpeg;
+                        pending.faceBox = evalFace.box;
                     }
                 }
                 if (cluster)
@@ -3437,6 +3909,12 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 if (isConfirmed) {
                     this.pendingConfirmations.delete(key);
                     if (isStranger && cluster) {
+                        // Requirement 8: Auto-learn confirmed non-recognized faces for future reference
+                        if (!cluster.learnedName) {
+                            const learned = await this.provider.learnUnknownFace(cameraName, cluster.id, pending.bestJpeg, pending.faceBox, pending.embedding);
+                            if (learned)
+                                cluster.learnedName = learned;
+                        }
                         if (!force && cluster.lastAlerted > 0 && now - cluster.lastAlerted < strangerCooldownMs) {
                             const minsLeft = Math.ceil((strangerCooldownMs - (now - cluster.lastAlerted)) / 60000);
                             note = `confirmed (${minsLeft}m stranger cooldown active)`;
@@ -3444,7 +3922,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                         else {
                             cluster.lastAlerted = now;
                             newlyConfirmedStrangers.push({ pending, cluster });
-                            note = `confirmed ${pending.requiredFrames}/${pending.requiredFrames} (stranger #${cluster.id} alert)`;
+                            note = `confirmed ${pending.requiredFrames}/${pending.requiredFrames} (${cluster.learnedName ?? `stranger #${cluster.id}`} alert)`;
                         }
                     }
                     else {
@@ -3466,8 +3944,8 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 }
                 this.provider.recordRecognition(cameraName, evalFace, pending.framesSeen, pending.requiredFrames, note);
             }
-            // If any faces are still waiting for confirmation within the 30s window, schedule a 3s re-check
             this.scheduleConfirmationRecheckIfNeeded();
+            const unknownFacesCount = evaluatedFaces.filter(f => f.status === 'unknown').length;
             const verdict = {
                 alert: stage1.alert,
                 severity: stage1.severity,
@@ -3475,15 +3953,24 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 save: stage1.save,
                 objects: stage1.objects,
                 faces: confirmedKnownNames,
+                unknownFacesCount,
                 evaluatedFaces,
+                licensePlates: stage1.licensePlates,
+                vehicles: stage1.vehicles,
+                deliveryCarrier: stage1.deliveryCarrier,
+                carriedItems: stage1.carriedItems,
                 bestFrameIndex: stage1.bestFrameIndex,
             };
-            const bestFrame = cameraJpegs[verdict.bestFrameIndex] ?? cameraJpegs[Math.floor(cameraJpegs.length / 2)];
-            this.console.log(`${used} analyzed ${cameraJpegs.length} frame(s)${isConfirmationRecheck ? ' [re-check]' : ''} in ${Date.now() - started}ms:`, JSON.stringify({
+            this.console.log(`${used} analyzed ${cameraJpegs.length} frame(s)${hasPrevBaseline ? ' (+baseline)' : ''}${isConfirmationRecheck ? ' [re-check]' : ''} in ${Date.now() - started}ms:`, JSON.stringify({
                 alert: verdict.alert,
+                sceneChanged: stage1.sceneChanged,
+                pixelDiff: diffInfo ? `${diffInfo.changedPercent}% (cluster ${diffInfo.largestClusterBlocks})` : 'n/a',
                 severity: verdict.severity,
                 summary: verdict.summary,
                 objects: verdict.objects,
+                licensePlates: verdict.licensePlates,
+                deliveryCarrier: verdict.deliveryCarrier,
+                carriedItems: verdict.carriedItems,
                 confirmedFaces: verdict.faces,
                 facesEvaluated: evaluatedFaces.map(f => ({
                     status: f.status,
@@ -3495,48 +3982,55 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 })),
             }));
             await this.emitDetections(verdict, bestFrame);
-            // 1. Send "<Name> arrived" notifications for newly confirmed known people (not on the Never Notify list)
-            for (const known of newlyConfirmedKnown) {
-                await this.sendArrivalOrFaceAlert(`${cameraName}: ${known.displayName} arrived`, `${known.displayName} recognized at ${cameraName}. ${known.summary}`, 'low', known.bestJpeg, ['person', 'face'], [known.displayName], 'none', `ai-arrival-${this.id}-${known.displayName.toLowerCase()}`);
-            }
-            // 2. Send confirmed Stranger alerts (seen in 3 frames within 30s, >= 80px wide & sharp, 15m cooldown)
             const faceMode = String(s.faceAlertMode ?? FACE_ALERT_MODES[0]);
-            if (faceMode !== 'Only alert when a known face is recognized') {
+            const peopleEnabled = Boolean(s.detectPeople ?? true);
+            // 1. Send "<Name> arrived" notifications for newly confirmed known people
+            if (peopleEnabled && faceMode !== 'Only alert when an unrecognized face/stranger is seen') {
+                for (const known of newlyConfirmedKnown) {
+                    await this.sendArrivalOrFaceAlert(`${cameraName}: ${known.displayName} arrived`, `${known.displayName} recognized at ${cameraName}. ${known.summary}`, 'low', known.bestJpeg, verdict, ['person', 'face'], [known.displayName], 'none', `ai-arrival-${this.id}-${known.displayName.toLowerCase()}`);
+                }
+            }
+            // 2. Send confirmed Unrecognized Face / Stranger alerts (and auto-learned reference tag)
+            if (peopleEnabled && faceMode !== 'Only alert when a recognized known face is seen') {
                 for (const { pending, cluster } of newlyConfirmedStrangers) {
                     const closestInfo = pending.closestName
                         ? ` (similarity ${pending.bestSimilarity.toFixed(2)}, closest ${pending.closestName})`
                         : '';
-                    await this.sendArrivalOrFaceAlert(`${cameraName}: Unrecognized person`, `${pending.summary} [Confirmed in ${pending.framesSeen} frames, ${pending.widthPx}px${closestInfo}]`, pending.severity, pending.bestJpeg, pending.objects, ['unknown'], pending.save, `ai-stranger-${this.id}-${cluster.id}`);
+                    const learnedTag = cluster.learnedName ? ` | Saved as ${cluster.learnedName}` : '';
+                    await this.sendArrivalOrFaceAlert(`${cameraName}: Unrecognized person`, `Unrecognized person at ${cameraName}: ${pending.summary} [Confirmed in ${pending.framesSeen} frames, ${pending.widthPx}px${closestInfo}${learnedTag}]`, pending.severity, pending.bestJpeg, verdict, pending.objects, ['unknown'], pending.save, `ai-stranger-${this.id}-${cluster.id}`);
                 }
             }
-            // If this run was solely a 3s face confirmation re-check or we already sent a face/stranger alert, skip duplicate scene alert
             if (isConfirmationRecheck || newlyConfirmedKnown.length > 0 || newlyConfirmedStrangers.length > 0)
                 return;
-            // If a face is currently mid-confirmation (e.g. 1/2 known or 1/3 stranger), wait for the 3s re-check before firing a person alert!
-            if (!force && this.pendingConfirmations.size > 0) {
-                this.console.log(`Holding alert while confirming face across frames (${Array.from(this.pendingConfirmations.values())
-                    .map(p => `${p.displayName} ${p.framesSeen}/${p.requiredFrames}`)
-                    .join(', ')})...`);
+            // Filter out weather-only (falling leaves, wind, rain) and unchanged idle scenes (parked car, chair)
+            if (!force && ignoreIdleAndWeather && !verdict.objects.includes('person') && confirmedKnownNames.length === 0) {
+                if (stage1.weatherOrIdleOnly && (!diffInfo || !diffInfo.hasMeaningfulChange)) {
+                    this.console.log(`Alert skipped (idle object or weather only): ${verdict.summary}`);
+                    return;
+                }
+                if (hasPrevBaseline && diffInfo && !diffInfo.hasMeaningfulChange) {
+                    this.console.log(`Alert skipped: frame unchanged from previous (${diffInfo.changedPercent}% changed, cluster ${diffInfo.largestClusterBlocks} blocks) — idle scene.`);
+                    return;
+                }
+            }
+            // Check On/Off switches for People, Animals, Vehicles, Packages
+            if (!force && !this.passesCategorySwitches(verdict.objects, confirmedKnownNames.length > 0, unknownFacesCount > 0)) {
+                this.console.log(`Alert skipped: detected category [${verdict.objects.join(', ')}] is turned Off on this camera.`);
                 return;
             }
-            // If all detected people in this scene are on the "Never notify for these names" list (or suppressed household members), skip scene alert
             if (!force && confirmedKnownNames.length > 0) {
                 const allMuted = confirmedKnownNames.every(n => this.provider.isNameSuppressed(n));
-                if (allMuted || faceMode === 'Suppress security alerts when only known faces are seen') {
+                if (allMuted || faceMode === 'Suppress alerts when only recognized known faces are seen') {
                     this.console.log(`Alert suppressed for known household member(s): ${confirmedKnownNames.join(', ')}`);
                     return;
                 }
             }
-            if (!force && faceMode === 'Only alert when a known face is recognized' && confirmedKnownNames.length === 0)
-                return;
-            // If a person was seen and already alerted inside theirknown/stranger cooldown window, do not re-announce
-            if (!force && evaluatedFaces.some(f => f.status === 'known' || f.status === 'unknown'))
+            if (!force && faceMode === 'Only alert when a recognized known face is seen' && confirmedKnownNames.length === 0)
                 return;
             const order = ['low', 'medium', 'high'];
             const meetsSeverity = order.indexOf(verdict.severity) >= order.indexOf(s.minSeverity || 'low');
             if (!force && !(verdict.alert && meetsSeverity))
                 return;
-            // Object filter check
             const requiredObjects = asList(s.objectFilter).map(x => x.toLowerCase());
             if (!force && requiredObjects.length > 0) {
                 const hasRequired = requiredObjects.some(reqObj => verdict.objects.includes(reqObj));
@@ -3555,16 +4049,27 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 plan = 'both';
             else if (choice.startsWith('Let the AI'))
                 plan = verdict.save;
+            // Build rich metadata tags (Known vs Unrecognized face, Courier, Carried items, License plates, Objects)
             const metaTags = [];
             if (verdict.faces.length)
                 metaTags.push(`Recognized: ${verdict.faces.join(', ')}`);
+            else if (verdict.objects.includes('person'))
+                metaTags.push('Person: Unrecognized');
+            if (verdict.deliveryCarrier)
+                metaTags.push(`Courier: ${verdict.deliveryCarrier}`);
+            if (verdict.carriedItems.length)
+                metaTags.push(`Carrying: ${verdict.carriedItems.join(', ')}`);
+            if (verdict.licensePlates.length)
+                metaTags.push(`Plate: ${verdict.licensePlates.join(', ')}`);
+            if (verdict.vehicles.length)
+                metaTags.push(`Vehicle: ${verdict.vehicles.join(', ')}`);
             const notableObjects = verdict.objects.filter(o => OBJECT_FILTER_CHOICES.includes(o) && o !== 'face');
             if (notableObjects.length)
                 metaTags.push(`Objects: ${notableObjects.join(', ')}`);
             const enrichedMessage = metaTags.length
                 ? `${verdict.summary} [${metaTags.join(' | ')}]`
                 : verdict.summary;
-            await this.sendArrivalOrFaceAlert(`${cameraName}: ${verdict.severity.toUpperCase()}`, enrichedMessage, verdict.severity, bestFrame, verdict.objects, verdict.faces, plan, `ai-alert-${this.id}`);
+            await this.sendArrivalOrFaceAlert(`${cameraName}: ${verdict.severity.toUpperCase()}`, enrichedMessage, verdict.severity, bestFrame, verdict, verdict.objects, verdict.faces, plan, `ai-alert-${this.id}`);
         }
         catch (e) {
             this.console.error('AI analysis failed', e);
@@ -3573,30 +4078,66 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
             this.busy = false;
         }
     }
-    async sendArrivalOrFaceAlert(title, message, severity, frameJpeg, objects, faces, plan, tag) {
+    async sendArrivalOrFaceAlert(title, message, severity, frameJpeg, verdict, objects, faces, plan, tag) {
         const s = this.storageSettings.values;
         const cameraName = systemManager$1.getDeviceById(this.id)?.name ?? 'Camera';
+        const now = new Date();
+        const timestampText = this.provider.formatTimestamp(now);
+        const isoTimestamp = now.toISOString();
+        const messageWithTime = `${message} (${timestampText})`;
+        // Requirement 10: Save alert snapshot to destination drive (HA /media, network share, Google Drive, Dropbox, WebDAV)
+        const savedInfo = await this.provider.saveAlertSnapshot(cameraName, frameJpeg, {
+            title,
+            message: messageWithTime,
+            timestamp: timestampText,
+            isoTimestamp,
+            cameraId: this.id,
+            cameraName,
+            severity,
+            objects,
+            faces,
+            licensePlates: verdict.licensePlates,
+            vehicles: verdict.vehicles,
+            deliveryCarrier: verdict.deliveryCarrier,
+            carriedItems: verdict.carriedItems,
+        });
+        if (savedInfo.uploadedDestinations.length)
+            this.console.log(`Snapshot saved to: ${savedInfo.uploadedDestinations.join(', ')}`);
+        for (const err of savedInfo.errors)
+            this.console.warn(`Snapshot storage warning: ${err}`);
         const needsFrame = plan === 'snapshot' || plan === 'both';
         const media = s.attachSnapshot || needsFrame
             ? await mediaManager$1.createMediaObject(frameJpeg, 'image/jpeg')
             : undefined;
         const alert = await this.provider.sendAlert({
             title,
-            message,
+            message: messageWithTime,
+            rawSummary: verdict.summary,
+            timestampText,
+            isoTimestamp,
+            cameraId: this.id,
+            cameraName,
             severity,
             channels: asList(s.channels),
             jpeg: s.attachSnapshot ? frameJpeg : undefined,
             haCameraEntity: String(s.haCameraEntity ?? '').trim() || undefined,
+            haImageUrl: savedInfo.haMediaUrl,
+            savedSnapshotPath: savedInfo.localPath,
             tag,
             objects,
             faces,
+            unknownFacesCount: verdict.unknownFacesCount,
+            licensePlates: verdict.licensePlates,
+            vehicles: verdict.vehicles,
+            deliveryCarrier: verdict.deliveryCarrier,
+            carriedItems: verdict.carriedItems,
         });
         if (alert.sent.length)
             this.console.log(`Alert sent (${title}) via: ${alert.sent.join(', ')}`);
         for (const e of alert.errors)
             this.console.error(`Notification failed - ${e}`);
         if (!alert.configured)
-            this.console.warn('No phone/app notification channel is configured on the AI Vision Alerts plugin page.');
+            this.console.warn('No notification channel is configured on the AI Vision Alerts plugin page.');
         const notifierIds = Array.isArray(s.notifiers) ? s.notifiers : s.notifiers ? [s.notifiers] : [];
         for (const id of notifierIds) {
             const notifier = systemManager$1.getDeviceById(id);
@@ -3604,16 +4145,23 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
                 continue;
             try {
                 await notifier.sendNotification(title, {
-                    body: message,
+                    body: messageWithTime,
                     tag: 'ai-vision-alerts',
                     data: {
                         source: 'ai-vision-alerts',
                         cameraId: this.id,
                         cameraName,
+                        timestamp: timestampText,
+                        isoTimestamp,
                         severity,
-                        summary: message,
+                        summary: messageWithTime,
                         objects,
                         faces,
+                        licensePlates: verdict.licensePlates,
+                        vehicles: verdict.vehicles,
+                        deliveryCarrier: verdict.deliveryCarrier,
+                        carriedItems: verdict.carriedItems,
+                        savedSnapshotPath: savedInfo.localPath,
                         save: plan,
                     },
                 }, media);
@@ -3625,7 +4173,7 @@ class AIAlertsMixin extends settingsMixinExports.SettingsMixinDeviceBase {
     }
 }
 /* ------------------------------------------------------------------ */
-/* Plugin (provider settings + face recognition + recent recognitions)  */
+/* Plugin (provider, face learning, storage, webhook, notifications)    */
 /* ------------------------------------------------------------------ */
 class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
     callsToday = 0;
@@ -3633,12 +4181,13 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
     faceCacheKey = '';
     faceCache = [];
     recentLines = [];
+    lastSnapshotCleanup = 0;
     storageSettings = new storageSettingsExports.StorageSettings(this, {
         /* ---------------- AI provider selection ---------------- */
         aiProvider: {
             group: 'AI provider',
             title: 'AI provider',
-            description: 'The service that analyzes frames. Fill in that provider\'s section below.',
+            description: 'Works with all AI providers and vision models (Claude, OpenAI, Gemini, local Ollama, and any OpenAI-compatible server).',
             type: 'string',
             choices: PROVIDER_CHOICES,
             defaultValue: PROVIDER_CHOICES[0],
@@ -3657,6 +4206,13 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
             description: 'Local models on CPU can be slow, so raise this for Ollama.',
             type: 'number',
             defaultValue: 60,
+        },
+        locationTimeZone: {
+            group: 'AI provider',
+            title: 'Device / Location time zone (optional)',
+            description: 'IANA time zone used to stamp date & time on every alert (e.g. America/Los_Angeles, America/New_York, Europe/London). ' +
+                'Leave blank to automatically use your server/device local time zone.',
+            placeholder: 'America/Los_Angeles',
         },
         dailyLimit: {
             group: 'AI provider',
@@ -3679,8 +4235,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         testProvider: {
             group: 'AI provider',
             title: 'Test provider connection',
-            description: 'Sends a text-only request to the main (and fallback) provider and logs the result in this plugin\'s ' +
-                'console. Checks URL, key and model, but not image support.',
+            description: 'Sends a text-only request to the main (and fallback) provider and logs the result in this plugin\'s console.',
             type: 'button',
             onPut: async () => {
                 const { chain, problems } = this.getProviderChain();
@@ -3707,7 +4262,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         enableFaceRecognition: {
             group: 'Face & Object Recognition',
             title: 'Enable AI face recognition',
-            description: 'Enables quality gates, similarity scoring, multi-frame confirmation, and "<Name> arrived" / stranger alerts.',
+            description: 'Distinguishes known faces from unrecognized faces, auto-learns new faces, and alerts on both.',
             type: 'boolean',
             defaultValue: true,
         },
@@ -3717,6 +4272,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
             description: 'Folder path containing reference photos (.jpg, .png, .webp). On Home Assistant OS add-on, use /media/faces (mapped to HA\'s Media folder). ' +
                 'Name files after the person (e.g. Alex.jpg, Alex_2.jpg) or place them in subfolders (e.g. /media/faces/Alex/1.jpg).',
             placeholder: '/media/faces',
+            defaultValue: '/media/faces',
         },
         knownFacesEntries: {
             group: 'Face & Object Recognition',
@@ -3725,6 +4281,20 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                 'Example for Home Assistant add-on: Alex = /media/faces/Alex.jpg',
             type: 'textarea',
             placeholder: 'Alex = /media/faces/Alex.jpg\nBob = /media/faces/Bob.jpg',
+        },
+        autoLearnUnknownFaces: {
+            group: 'Face & Object Recognition',
+            title: 'Auto-learn non-recognized faces for future reference',
+            description: 'Automatically crops and saves confirmed unrecognized faces to the Learned faces directory below so they can be recognized on future visits (rename the saved .jpg file to the person\'s name anytime).',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        learnedFacesDir: {
+            group: 'Face & Object Recognition',
+            title: 'Learned faces directory',
+            description: 'Where newly learned non-recognized faces are saved and loaded from. On Home Assistant OS add-on, /media/faces/learned is accessible directly in HA Media.',
+            placeholder: '/media/faces/learned',
+            defaultValue: '/media/faces/learned',
         },
         neverNotifyNames: {
             group: 'Face & Object Recognition',
@@ -3795,12 +4365,12 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
             title: 'Max reference face photos per AI call',
             description: 'Caps how many reference photos are sent when scoring a face.',
             type: 'number',
-            defaultValue: 6,
+            defaultValue: 8,
         },
         testKnownFaces: {
             group: 'Face & Object Recognition',
-            title: 'Load & verify enrolled faces',
-            description: 'Reloads reference face photos from the directory and list above and logs the results in the console.',
+            title: 'Load & verify enrolled + learned faces',
+            description: 'Reloads reference face photos from the known and learned directories/list and logs the results in the console.',
             type: 'button',
             onPut: async () => {
                 this.faceCacheKey = '';
@@ -3837,6 +4407,84 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                 await this.storageSettings.putSetting('recentRecognitions', 'No face recognitions recorded yet.');
                 this.console.log('Cleared recent recognitions history.');
             },
+        },
+        /* ---------------- Snapshot Storage (HA Disk, Network Drive, Google Drive, Dropbox, WebDAV) ---------------- */
+        saveSnapshots: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Save notification snapshots to destination drive',
+            description: 'Automatically saves a JPEG snapshot (and metadata JSON) for every alert to the destination folder and/or cloud storage below.',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        snapshotDir: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Destination folder (Home Assistant disk, local drive, or network share)',
+            description: 'On Home Assistant OS add-on, use /media/ai-alerts (HA Media browser), /share/ai-alerts, or /config/www/ai-alerts. ' +
+                'On Windows/macOS/Linux, use any local folder or mounted SMB/NFS network drive (e.g. \\\\NAS\\alerts or /mnt/nas/alerts).',
+            placeholder: '/media/ai-alerts',
+            defaultValue: '/media/ai-alerts',
+        },
+        autoDeleteSnapshots: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Automatically delete old snapshots',
+            description: 'Automatically deletes saved snapshots and metadata files older than the retention days below so your Home Assistant disk or drive never fills up.',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        snapshotRetentionDays: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Delete snapshots older than (days)',
+            description: 'Snapshots and date folders older than this many days (e.g. 7, 14, 30) are deleted automatically.',
+            type: 'number',
+            defaultValue: 14,
+        },
+        cleanupSnapshotsNow: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Delete expired snapshots now',
+            description: 'Immediately scans the destination drive (and configured cloud folders) and deletes snapshots older than your retention days.',
+            type: 'button',
+            onPut: async () => {
+                await this.cleanupOldSnapshots(true);
+            },
+        },
+        gdriveAccessToken: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Google Drive OAuth access token (optional)',
+            description: 'Uploads alert snapshots directly to your Google Drive.',
+            type: 'password',
+        },
+        gdriveFolderId: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Google Drive Folder ID (optional)',
+            description: 'The folder ID from the Google Drive URL where snapshots should be uploaded (blank uploads to root).',
+        },
+        dropboxAccessToken: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Dropbox Access Token (optional)',
+            description: 'Create a token in the Dropbox App Console (files.content.write scope) to upload snapshots to Dropbox.',
+            type: 'password',
+        },
+        dropboxFolder: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'Dropbox destination folder',
+            description: 'Folder path inside Dropbox (e.g. /AI-Vision-Alerts).',
+            placeholder: '/AI-Vision-Alerts',
+            defaultValue: '/AI-Vision-Alerts',
+        },
+        webdavUrl: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'WebDAV / Nextcloud / Synology / Cloud folder URL (optional)',
+            description: 'Uploads snapshots via HTTP PUT to any WebDAV server, Nextcloud, OwnCloud, or cloud storage gateway.',
+            placeholder: 'https://nextcloud.example.com/remote.php/dav/files/user/AI-Alerts',
+        },
+        webdavUsername: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'WebDAV username (optional)',
+        },
+        webdavPassword: {
+            group: 'Snapshot Storage & Cloud Backup',
+            title: 'WebDAV password / app token (optional)',
+            type: 'password',
         },
         /* ---------------- Per-provider settings ---------------- */
         anthropicKey: { group: 'Anthropic (Claude)', title: 'API key', type: 'password' },
@@ -3875,8 +4523,8 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         ollamaModel: {
             group: 'Ollama (local)',
             title: 'Model (optional)',
-            description: 'Must support images, e.g. llava, llama3.2-vision, qwen2.5vl, gemma3. Blank uses llava.',
-            placeholder: 'llava',
+            description: 'Works with any Ollama vision model: llama3.2-vision, llava, qwen2.5vl, gemma3, minicpm-v, etc.',
+            placeholder: 'llama3.2-vision',
         },
         ollamaKey: {
             group: 'Ollama (local)',
@@ -3904,7 +4552,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         haUrl: {
             group: 'Notify: Home Assistant',
             title: 'Home Assistant URL',
-            description: 'e.g. http://192.168.100.2:8123 (plain http is fine on your local network).',
+            description: 'e.g. http://192.168.100.2:8123. When running as a Home Assistant OS add-on, can also auto-connect via Supervisor if left blank.',
             placeholder: 'http://192.168.100.2:8123',
         },
         haToken: {
@@ -3913,11 +4561,46 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
             description: 'Home Assistant > your profile > Security > Long-lived access tokens > Create token.',
             type: 'password',
         },
+        haPersistentNotification: {
+            group: 'Notify: Home Assistant',
+            title: 'Send Home Assistant persistent notification (sidebar bell)',
+            description: 'Creates a persistent notification inside Home Assistant\'s Notifications panel on every alert.',
+            type: 'boolean',
+            defaultValue: true,
+        },
         haNotifyServices: {
             group: 'Notify: Home Assistant',
-            title: 'Notify service(s)',
+            title: 'Mobile / Notify service(s) (optional)',
             description: 'Comma-separated, without the "notify." prefix, e.g. mobile_app_pixel_9, mobile_app_iphone. ' +
-                'Find yours in Home Assistant > Developer tools > Actions by searching "notify.mobile_app".',
+                'If left blank, automatically discovers all registered notify.mobile_app_* devices in Home Assistant!',
+        },
+        /* ---------------- Webhook (Tesla, Android/Fire TV, Home Assistant, Custom) ---------------- */
+        webhookUrls: {
+            group: 'Notify: Webhook (Tesla, Android/Fire TV, HA)',
+            title: 'Webhook URL(s)',
+            description: 'One or more HTTP/HTTPS POST URLs (comma or newline separated). ' +
+                'Supports Home Assistant webhooks (http://ha:8123/api/webhook/ai_alert), Android TV / Fire TV Pipup overlays (http://tv-ip:7979/notify), ' +
+                'Tesla car notification webhooks, Node-RED, n8n, Discord, or custom servers.',
+            type: 'textarea',
+            placeholder: 'http://192.168.100.2:8123/api/webhook/ai_vision_alert\nhttp://192.168.100.50:7979/notify',
+        },
+        webhookToken: {
+            group: 'Notify: Webhook (Tesla, Android/Fire TV, HA)',
+            title: 'Webhook Bearer token / secret (optional)',
+            description: 'Sent as Authorization: Bearer <token> and X-Webhook-Secret header.',
+            type: 'password',
+        },
+        webhookIncludeImage: {
+            group: 'Notify: Webhook (Tesla, Android/Fire TV, HA)',
+            title: 'Include base64 snapshot image in Webhook JSON',
+            description: 'Embeds the alert JPEG in the JSON payload (and formats media for Android TV / Fire TV Pipup display).',
+            type: 'boolean',
+            defaultValue: true,
+        },
+        webhookVideoStreamUrl: {
+            group: 'Notify: Webhook (Tesla, Android/Fire TV, HA)',
+            title: 'Video / Stream URL for Android/Fire TV or Tesla (optional)',
+            description: 'Optional stream or dashboard URL included in webhook payloads for TV popups and car browser links.',
         },
         ntfyUrl: {
             group: 'Notify: ntfy',
@@ -3967,12 +4650,18 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         testNotifications: {
             group: 'Notify: test',
             title: 'Send test notification to all configured channels',
-            description: 'Text only. Check this plugin\'s console for the result of each channel.',
+            description: 'Tests Home Assistant (persistent + mobile), Webhook, ntfy, Pushover, and Telegram. Check this plugin\'s console.',
             type: 'button',
             onPut: async () => {
+                const now = new Date();
+                const ts = this.formatTimestamp(now);
                 const result = await this.sendAlert({
                     title: 'AI Vision Alerts',
-                    message: 'Test notification from Scrypted.',
+                    message: `Test notification from Scrypted (${ts}).`,
+                    rawSummary: 'Test notification from Scrypted.',
+                    timestampText: ts,
+                    isoTimestamp: now.toISOString(),
+                    cameraName: 'Test Camera',
                     severity: 'low',
                     channels: [],
                 });
@@ -3991,8 +4680,19 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
     }
     async putSetting(key, value) {
         await this.storageSettings.putSetting(key, value);
-        if (['enableFaceRecognition', 'knownFacesDir', 'knownFacesEntries', 'maxFaceReferences'].includes(key))
+        if ([
+            'enableFaceRecognition',
+            'knownFacesDir',
+            'knownFacesEntries',
+            'learnedFacesDir',
+            'autoLearnUnknownFaces',
+            'maxFaceReferences',
+        ].includes(key)) {
             this.faceCacheKey = '';
+        }
+    }
+    formatTimestamp(date = new Date()) {
+        return formatDeviceDateTime(date, String(this.storageSettings.values.locationTimeZone ?? ''));
     }
     /* ---------------- Face recognition parameters & Recent Recognitions panel ---------------- */
     isFaceRecognitionEnabled() {
@@ -4017,7 +4717,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         return Math.min(8, Math.max(1, Math.round(Number(this.storageSettings.values.strangerConfirmFrames ?? 3))));
     }
     confirmationWindowMs() {
-        return 30 * 1000; // 30 seconds
+        return 30 * 1000;
     }
     knownCooldownMs() {
         return Math.max(0.5, Number(this.storageSettings.values.knownCooldownMinutes ?? 2)) * 60 * 1000;
@@ -4025,7 +4725,6 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
     strangerCooldownMs() {
         return Math.max(1, Number(this.storageSettings.values.strangerCooldownMinutes ?? 15)) * 60 * 1000;
     }
-    /** Returns true if `personName` is listed in "Never notify for these names" (or if "family"/"all" is listed). */
     isNameSuppressed(personName) {
         const raw = String(this.storageSettings.values.neverNotifyNames ?? '').trim();
         if (!raw)
@@ -4038,11 +4737,8 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
             return true;
         return entries.includes(personName.trim().toLowerCase());
     }
-    /** Appends a formatted line to the "Recent recognitions" panel on the plugin settings page. */
-    recordRecognition(cameraName, ef, framesSeen, requiredFrames, statusNote) {
-        const now = new Date();
-        const pad = (n) => String(n).padStart(2, '0');
-        const ts = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    recordRecognition(cameraName, ef, _framesSeen, _requiredFrames, statusNote) {
+        const ts = this.formatTimestamp(new Date());
         const simPart = ef.bestMatchName
             ? `similarity ${ef.bestSimilarity.toFixed(2)}, closest ${ef.bestMatchName}${ef.runnerUpName ? `, 2nd ${ef.runnerUpName} ${ef.runnerUpSimilarity.toFixed(2)}` : ''}`
             : `similarity ${ef.bestSimilarity.toFixed(2)}`;
@@ -4061,7 +4757,48 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         this.storageSettings.putSetting('recentRecognitions', text).catch(() => { });
         this.console.log(`Face recognition: ${line}`);
     }
-    /* ---------------- Known faces loading & caching ---------------- */
+    /** Requirement 8: Auto-learns a confirmed unrecognized face by saving its crop to `learnedFacesDir` and adding it to memory. */
+    async learnUnknownFace(cameraName, clusterId, frameJpeg, box, embedding) {
+        const v = this.storageSettings.values;
+        if (!v.autoLearnUnknownFaces)
+            return undefined;
+        const learnedDir = String(v.learnedFacesDir ?? '/media/faces/learned').trim();
+        if (!learnedDir)
+            return undefined;
+        try {
+            const ffmpegPath = await mediaManager$1.getFFmpegPath();
+            const cropped = await cropFaceJpeg(ffmpegPath, frameJpeg, box);
+            const resolvedDir = path__namespace.resolve(learnedDir);
+            await fs__namespace.mkdir(resolvedDir, { recursive: true });
+            // Check if this face already matches an existing learned face in memory
+            for (const existing of this.faceCache) {
+                if (existing.isLearned && embedding && existing.embedding && cosineSimilarity(embedding, existing.embedding) >= 0.75) {
+                    return existing.name;
+                }
+            }
+            const existingFiles = await fs__namespace.readdir(resolvedDir).catch(() => []);
+            const nextNum = existingFiles.filter(f => /\.(jpg|jpeg|png)$/i.test(f)).length + 1;
+            const learnedName = `Visitor_${nextNum}`;
+            const safeCam = cameraName.replace(/[^a-zA-Z0-9_-]/g, '_');
+            const fileName = `${learnedName}_${safeCam}_1.jpg`;
+            const filePath = path__namespace.join(resolvedDir, fileName);
+            await fs__namespace.writeFile(filePath, cropped);
+            this.faceCache.push({
+                name: learnedName,
+                jpeg: cropped,
+                source: filePath,
+                embedding,
+                isLearned: true,
+            });
+            this.console.log(`Auto-learned new face as "${learnedName}" saved to ${filePath} (rename file to person's name to label them).`);
+            return learnedName;
+        }
+        catch (e) {
+            this.console.warn(`Could not save learned face to "${learnedDir}": ${errMsg(e)}`);
+            return `Stranger_${clusterId}`;
+        }
+    }
+    /* ---------------- Known & Learned faces loading & caching ---------------- */
     async getKnownFaceNames() {
         const refs = await this.getKnownFaces(false);
         return Array.from(new Set(refs.map(r => r.name)));
@@ -4071,9 +4808,10 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         if (!v.enableFaceRecognition)
             return [];
         const dir = String(v.knownFacesDir ?? '').trim();
+        const learnedDir = v.autoLearnUnknownFaces ? String(v.learnedFacesDir ?? '').trim() : '';
         const entriesText = String(v.knownFacesEntries ?? '').trim();
-        const maxRefs = Math.min(20, Math.max(1, Math.round(Number(v.maxFaceReferences ?? 6))));
-        const cacheKey = `${dir}|${entriesText}|${maxRefs}`;
+        const maxRefs = Math.min(25, Math.max(1, Math.round(Number(v.maxFaceReferences ?? 8))));
+        const cacheKey = `${dir}|${learnedDir}|${entriesText}|${maxRefs}`;
         if (!forceReload && cacheKey === this.faceCacheKey)
             return this.faceCache;
         const loaded = [];
@@ -4085,19 +4823,20 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         catch {
             // optional
         }
-        const buildRef = async (name, raw, ext, source) => {
+        const buildRef = async (name, raw, ext, source, isLearned = false) => {
             const jpeg = await normalizeReferenceJpeg(raw, ext);
             let embedding;
             if (ffmpegPath) {
                 const patch = await analyzeFacePatch(ffmpegPath, jpeg, [0.15, 0.1, 0.7, 0.8]);
                 embedding = patch?.embedding;
             }
-            return { name, jpeg, source, embedding };
+            return { name, jpeg, source, embedding, isLearned };
         };
-        // 1. Scan directory if configured
-        if (dir) {
+        const scanDirectory = async (folder, isLearnedFolder) => {
+            if (!folder || loaded.length >= maxRefs)
+                return;
             try {
-                const resolvedDir = path__namespace.resolve(dir);
+                const resolvedDir = path__namespace.resolve(folder);
                 const dirEntries = await fs__namespace.readdir(resolvedDir, { withFileTypes: true });
                 for (const entry of dirEntries) {
                     if (loaded.length >= maxRefs)
@@ -4112,13 +4851,15 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                             continue;
                         try {
                             const raw = await fs__namespace.readFile(fullPath);
-                            loaded.push(await buildRef(person, raw, ext, fullPath));
+                            loaded.push(await buildRef(person, raw, ext, fullPath, isLearnedFolder));
                         }
                         catch (e) {
                             this.console.warn(`Could not load face image ${fullPath}: ${errMsg(e)}`);
                         }
                     }
                     else if (entry.isDirectory()) {
+                        if (fullPath === path__namespace.resolve(learnedDir) && !isLearnedFolder)
+                            continue; // avoid scanning learned subfolder twice
                         const person = entry.name.trim();
                         if (!person || person.startsWith('.'))
                             continue;
@@ -4133,7 +4874,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                                 const subPath = path__namespace.join(fullPath, sf);
                                 try {
                                     const raw = await fs__namespace.readFile(subPath);
-                                    loaded.push(await buildRef(person, raw, ext, subPath));
+                                    loaded.push(await buildRef(person, raw, ext, subPath, isLearnedFolder));
                                 }
                                 catch (e) {
                                     this.console.warn(`Could not load face image ${subPath}: ${errMsg(e)}`);
@@ -4146,11 +4887,13 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                     }
                 }
             }
-            catch (e) {
-                this.console.warn(`Could not read known faces directory "${dir}": ${errMsg(e)}`);
+            catch {
+                // directory may not exist yet until first face is learned
             }
-        }
-        // 2. Parse inline entries ("Name = URL / file path / data URI")
+        };
+        await scanDirectory(dir, false);
+        if (learnedDir && path__namespace.resolve(learnedDir) !== (dir ? path__namespace.resolve(dir) : ''))
+            await scanDirectory(learnedDir, true);
         if (entriesText && loaded.length < maxRefs) {
             const lines = entriesText.split(/\r?\n/);
             for (const line of lines) {
@@ -4160,10 +4903,8 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                 if (!trimmed || trimmed.startsWith('#'))
                     continue;
                 const eqIdx = trimmed.indexOf('=');
-                if (eqIdx <= 0) {
-                    this.console.warn(`Skipping invalid known face entry (expected "Name = path or URL"): ${trimmed}`);
+                if (eqIdx <= 0)
                     continue;
-                }
                 const name = trimmed.slice(0, eqIdx).trim();
                 const target = trimmed.slice(eqIdx + 1).trim();
                 if (!name || !target)
@@ -4190,7 +4931,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                         ext = path__namespace.extname(filePath).toLowerCase() || '.jpg';
                         raw = await fs__namespace.readFile(filePath);
                     }
-                    loaded.push(await buildRef(name, raw, ext, target));
+                    loaded.push(await buildRef(name, raw, ext, target, false));
                 }
                 catch (e) {
                     this.console.warn(`Could not load known face for "${name}" from "${target}": ${errMsg(e)}`);
@@ -4200,6 +4941,286 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         this.faceCacheKey = cacheKey;
         this.faceCache = loaded;
         return loaded;
+    }
+    /* ---------------- Snapshot Storage (HA Disk, Network Drive, Google Drive, Dropbox, WebDAV) ---------------- */
+    async saveAlertSnapshot(cameraName, jpeg, metadata) {
+        const v = this.storageSettings.values;
+        const info = { uploadedDestinations: [], errors: [] };
+        if (!v.saveSnapshots)
+            return info;
+        const now = new Date();
+        const { dateFolder, fileStamp } = formatSafeFileTimestamp(now, String(v.locationTimeZone ?? ''));
+        const safeCam = cameraName.replace(/[^a-zA-Z0-9_-]/g, '_') || 'Camera';
+        const fileName = `${fileStamp}_${safeCam}.jpg`;
+        // 1. Save to local / Home Assistant / mounted network drive folder
+        const dir = String(v.snapshotDir ?? '/media/ai-alerts').trim();
+        if (dir) {
+            try {
+                const camDateDir = path__namespace.join(path__namespace.resolve(dir), safeCam, dateFolder);
+                await fs__namespace.mkdir(camDateDir, { recursive: true });
+                const fullFilePath = path__namespace.join(camDateDir, fileName);
+                const latestPath = path__namespace.join(path__namespace.resolve(dir), safeCam, 'latest.jpg');
+                const metaPath = path__namespace.join(camDateDir, `${fileStamp}_${safeCam}.json`);
+                await fs__namespace.writeFile(fullFilePath, jpeg);
+                await fs__namespace.writeFile(latestPath, jpeg).catch(() => { });
+                await fs__namespace.writeFile(metaPath, JSON.stringify(metadata, null, 2)).catch(() => { });
+                info.localPath = fullFilePath;
+                info.uploadedDestinations.push(fullFilePath);
+                // If saved inside Home Assistant's /config/www or /media, expose the HA-accessible path for phone notifications
+                const normDir = dir.replace(/\\/g, '/').replace(/\/+$/, '');
+                if (normDir.startsWith('/config/www/')) {
+                    const rel = normDir.slice('/config/www/'.length);
+                    info.haMediaUrl = `/local/${rel}/${safeCam}/${dateFolder}/${fileName}`;
+                }
+                else if (normDir === '/config/www') {
+                    info.haMediaUrl = `/local/${safeCam}/${dateFolder}/${fileName}`;
+                }
+                else if (normDir.startsWith('/media/')) {
+                    const rel = normDir.slice('/media/'.length);
+                    info.haMediaUrl = `/media/local/${rel}/${safeCam}/${dateFolder}/${fileName}`;
+                }
+                else if (normDir === '/media') {
+                    info.haMediaUrl = `/media/local/${safeCam}/${dateFolder}/${fileName}`;
+                }
+            }
+            catch (e) {
+                info.errors.push(`Local/HA disk (${dir}): ${errMsg(e)}`);
+            }
+        }
+        // 2. Upload to Google Drive (if OAuth access token is configured)
+        const gdriveToken = String(v.gdriveAccessToken ?? '').trim();
+        if (gdriveToken) {
+            try {
+                const folderId = String(v.gdriveFolderId ?? '').trim();
+                const driveMeta = {
+                    name: fileName,
+                    mimeType: 'image/jpeg',
+                    description: String(metadata.message ?? ''),
+                };
+                if (folderId)
+                    driveMeta.parents = [folderId];
+                const boundary = `-------scryptedAiAlerts${Date.now()}`;
+                const metaPart = Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(driveMeta)}\r\n--${boundary}\r\nContent-Type: image/jpeg\r\n\r\n`, 'utf-8');
+                const endPart = Buffer.from(`\r\n--${boundary}--`, 'utf-8');
+                const body = Buffer.concat([metaPart, jpeg, endPart]);
+                await fetchOk('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+                    method: 'POST',
+                    headers: {
+                        authorization: `Bearer ${gdriveToken}`,
+                        'content-type': `multipart/related; boundary=${boundary}`,
+                    },
+                    body: new Uint8Array(body),
+                });
+                info.uploadedDestinations.push(`Google Drive (${fileName})`);
+            }
+            catch (e) {
+                info.errors.push(`Google Drive: ${errMsg(e)}`);
+            }
+        }
+        // 3. Upload to Dropbox (if Dropbox access token is configured)
+        const dropboxToken = String(v.dropboxAccessToken ?? '').trim();
+        if (dropboxToken) {
+            try {
+                const folder = (String(v.dropboxFolder ?? '/AI-Vision-Alerts').trim() || '/AI-Vision-Alerts').replace(/\/+$/, '');
+                const dropboxPath = `${folder.startsWith('/') ? folder : '/' + folder}/${safeCam}/${dateFolder}/${fileName}`;
+                await fetchOk('https://content.dropboxapi.com/2/files/upload', {
+                    method: 'POST',
+                    headers: {
+                        authorization: `Bearer ${dropboxToken}`,
+                        'content-type': 'application/octet-stream',
+                        'dropbox-api-arg': JSON.stringify({
+                            path: dropboxPath,
+                            mode: 'add',
+                            autorename: true,
+                            mute: true,
+                        }),
+                    },
+                    body: new Uint8Array(jpeg),
+                });
+                info.uploadedDestinations.push(`Dropbox (${dropboxPath})`);
+            }
+            catch (e) {
+                info.errors.push(`Dropbox: ${errMsg(e)}`);
+            }
+        }
+        // 4. Upload to WebDAV / Nextcloud / Cloud HTTP PUT URL (if configured)
+        const webdavBase = String(v.webdavUrl ?? '').trim().replace(/\/+$/, '');
+        if (webdavBase) {
+            try {
+                const headers = { 'content-type': 'image/jpeg' };
+                const user = String(v.webdavUsername ?? '').trim();
+                const pass = String(v.webdavPassword ?? '').trim();
+                if (user || pass)
+                    headers.authorization = `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+                await fetchOk(`${webdavBase}/${encodeURIComponent(fileName)}`, {
+                    method: 'PUT',
+                    headers,
+                    body: new Uint8Array(jpeg),
+                });
+                info.uploadedDestinations.push(`WebDAV (${fileName})`);
+            }
+            catch (e) {
+                info.errors.push(`WebDAV: ${errMsg(e)}`);
+            }
+        }
+        // Periodically run automatic snapshot retention cleanup in the background (at most once every 6 hours)
+        const nowMs = Date.now();
+        if (Boolean(v.autoDeleteSnapshots ?? true) && nowMs - this.lastSnapshotCleanup > 6 * 60 * 60 * 1000) {
+            this.lastSnapshotCleanup = nowMs;
+            this.cleanupOldSnapshots(false).catch(e => this.console.warn('Auto snapshot cleanup error:', errMsg(e)));
+        }
+        return info;
+    }
+    /** Automatically deletes saved snapshots and date folders older than `snapshotRetentionDays` days. */
+    async cleanupOldSnapshots(forceLog = false) {
+        const v = this.storageSettings.values;
+        if (!forceLog && !Boolean(v.autoDeleteSnapshots ?? true))
+            return;
+        const days = Math.max(1, Number(v.snapshotRetentionDays ?? 14));
+        const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+        const { dateFolder: cutoffDateStr } = formatSafeFileTimestamp(new Date(cutoffMs), String(v.locationTimeZone ?? ''));
+        let deletedLocal = 0;
+        let deletedCloud = 0;
+        // 1. Clean up local / Home Assistant disk / mounted network share
+        const dir = String(v.snapshotDir ?? '/media/ai-alerts').trim();
+        if (dir) {
+            try {
+                const rootDir = path__namespace.resolve(dir);
+                const camDirs = await fs__namespace.readdir(rootDir, { withFileTypes: true }).catch(() => []);
+                for (const camEntry of camDirs) {
+                    const camPath = path__namespace.join(rootDir, camEntry.name);
+                    if (!camEntry.isDirectory())
+                        continue;
+                    const subEntries = await fs__namespace.readdir(camPath, { withFileTypes: true }).catch(() => []);
+                    for (const sub of subEntries) {
+                        const subPath = path__namespace.join(camPath, sub.name);
+                        if (sub.isDirectory()) {
+                            // Date folder formatted as YYYY-MM-DD
+                            if (/^\d{4}-\d{2}-\d{2}$/.test(sub.name)) {
+                                if (sub.name < cutoffDateStr) {
+                                    const filesInside = await fs__namespace.readdir(subPath).catch(() => []);
+                                    await fs__namespace.rm(subPath, { recursive: true, force: true });
+                                    deletedLocal += Math.max(1, filesInside.length);
+                                    continue;
+                                }
+                            }
+                            // Also check individual files inside subfolder by mtime
+                            const files = await fs__namespace.readdir(subPath, { withFileTypes: true }).catch(() => []);
+                            let remaining = 0;
+                            for (const f of files) {
+                                const fPath = path__namespace.join(subPath, f.name);
+                                try {
+                                    const st = await fs__namespace.stat(fPath);
+                                    if (st.mtimeMs < cutoffMs) {
+                                        await fs__namespace.rm(fPath, { force: true });
+                                        deletedLocal++;
+                                    }
+                                    else {
+                                        remaining++;
+                                    }
+                                }
+                                catch {
+                                    // ignore
+                                }
+                            }
+                            if (remaining === 0 && files.length > 0)
+                                await fs__namespace.rm(subPath, { recursive: true, force: true }).catch(() => { });
+                        }
+                        else if (sub.isFile() && sub.name !== 'latest.jpg') {
+                            try {
+                                const st = await fs__namespace.stat(subPath);
+                                if (st.mtimeMs < cutoffMs) {
+                                    await fs__namespace.rm(subPath, { force: true });
+                                    deletedLocal++;
+                                }
+                            }
+                            catch {
+                                // ignore
+                            }
+                        }
+                    }
+                }
+            }
+            catch (e) {
+                if (forceLog)
+                    this.console.warn(`Snapshot cleanup warning (${dir}): ${errMsg(e)}`);
+            }
+        }
+        // 2. Clean up expired snapshots in Google Drive (if folder ID + OAuth token are configured)
+        const gdriveToken = String(v.gdriveAccessToken ?? '').trim();
+        const gdriveFolderId = String(v.gdriveFolderId ?? '').trim();
+        if (gdriveToken && gdriveFolderId) {
+            try {
+                const cutoffIso = new Date(cutoffMs).toISOString();
+                const q = `'${gdriveFolderId}' in parents and mimeType='image/jpeg' and createdTime < '${cutoffIso}' and trashed = false`;
+                const listUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)&pageSize=100`;
+                const res = await fetch(listUrl, {
+                    headers: { authorization: `Bearer ${gdriveToken}` },
+                    signal: AbortSignal.timeout(15000),
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    for (const file of data.files ?? []) {
+                        if (!file?.id)
+                            continue;
+                        const delRes = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}`, {
+                            method: 'DELETE',
+                            headers: { authorization: `Bearer ${gdriveToken}` },
+                            signal: AbortSignal.timeout(10000),
+                        });
+                        if (delRes.ok)
+                            deletedCloud++;
+                    }
+                }
+            }
+            catch (e) {
+                if (forceLog)
+                    this.console.warn(`Google Drive snapshot cleanup warning: ${errMsg(e)}`);
+            }
+        }
+        // 3. Clean up expired YYYY-MM-DD date folders in Dropbox (if Dropbox token is configured)
+        const dropboxToken = String(v.dropboxAccessToken ?? '').trim();
+        if (dropboxToken) {
+            try {
+                const folder = (String(v.dropboxFolder ?? '/AI-Vision-Alerts').trim() || '/AI-Vision-Alerts').replace(/\/+$/, '');
+                const rootPath = folder.startsWith('/') ? folder : '/' + folder;
+                const listRes = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
+                    method: 'POST',
+                    headers: {
+                        authorization: `Bearer ${dropboxToken}`,
+                        'content-type': 'application/json',
+                    },
+                    body: JSON.stringify({ path: rootPath, recursive: true }),
+                    signal: AbortSignal.timeout(15000),
+                });
+                if (listRes.ok) {
+                    const listJson = await listRes.json();
+                    for (const entry of listJson.entries ?? []) {
+                        if (entry?.['.tag'] === 'folder' && /^\d{4}-\d{2}-\d{2}$/.test(entry.name) && entry.name < cutoffDateStr) {
+                            const delRes = await fetch('https://api.dropboxapi.com/2/files/delete_v2', {
+                                method: 'POST',
+                                headers: {
+                                    authorization: `Bearer ${dropboxToken}`,
+                                    'content-type': 'application/json',
+                                },
+                                body: JSON.stringify({ path: entry.path_lower || entry.path_display }),
+                                signal: AbortSignal.timeout(10000),
+                            });
+                            if (delRes.ok)
+                                deletedCloud++;
+                        }
+                    }
+                }
+            }
+            catch (e) {
+                if (forceLog)
+                    this.console.warn(`Dropbox snapshot cleanup warning: ${errMsg(e)}`);
+            }
+        }
+        if (forceLog || deletedLocal > 0 || deletedCloud > 0) {
+            this.console.log(`Snapshot cleanup (> ${days} day(s), older than ${cutoffDateStr}): removed ${deletedLocal} local file(s)/item(s)` +
+                (deletedCloud > 0 ? ` and ${deletedCloud} cloud item(s).` : '.'));
+        }
     }
     /* ---------------- AI providers ---------------- */
     getConfigFor(id) {
@@ -4217,7 +5238,6 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
                 return { provider: id, apiKey: v.customKey, model: v.customModel, baseUrl: v.customUrl };
         }
     }
-    /** Main provider first, then the optional fallback. Unusable providers are reported in `problems`. */
     getProviderChain() {
         const v = this.storageSettings.values;
         const ids = [providerId(v.aiProvider)];
@@ -4243,12 +5263,11 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
     }
     tryConsumeQuota(cfg) {
         const targetCfg = cfg ?? this.getConfigFor(providerId(this.storageSettings.values.aiProvider));
-        // Local Ollama (any model) and local LAN endpoints have no cloud billing quota—never block them
         if (isLocalProvider(targetCfg))
             return true;
         const limit = Number(this.storageSettings.values.dailyLimit ?? 0);
         if (limit <= 0)
-            return true; // 0 = unlimited
+            return true;
         const today = new Date().toDateString();
         if (today !== this.callsDay) {
             this.callsDay = today;
@@ -4259,10 +5278,15 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         this.callsToday++;
         return true;
     }
-    /* ---------------- Notifications ---------------- */
+    /* ---------------- Notifications (HA Persistent + Mobile, Webhook, ntfy, Pushover, Telegram) ---------------- */
     haConfigured() {
         const v = this.storageSettings.values;
-        return !!(String(v.haUrl ?? '').trim() && String(v.haToken ?? '').trim() && String(v.haNotifyServices ?? '').trim());
+        const hasExplicit = !!(String(v.haUrl ?? '').trim() && String(v.haToken ?? '').trim());
+        const hasSupervisor = !!process.env.SUPERVISOR_TOKEN;
+        return hasExplicit || hasSupervisor;
+    }
+    webhookConfigured() {
+        return !!String(this.storageSettings.values.webhookUrls ?? '').trim();
     }
     ntfyConfigured() {
         return !!String(this.storageSettings.values.ntfyTopic ?? '').trim();
@@ -4275,15 +5299,16 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         const v = this.storageSettings.values;
         return !!(String(v.telegramToken ?? '').trim() && String(v.telegramChatId ?? '').trim());
     }
-    /** Sends to every selected channel that is configured (all of them if none are selected). */
     async sendAlert(req) {
         const selected = req.channels.length ? req.channels : CHANNELS;
         const jobs = [];
         if (selected.includes('Home Assistant') && this.haConfigured())
             jobs.push([
                 'Home Assistant',
-                () => this.sendHomeAssistantNotification(req.title, req.message, req.haCameraEntity, req.tag, req.objects, req.faces),
+                () => this.sendHomeAssistantNotification(req.title, req.message, req.haCameraEntity, req.haImageUrl, req.tag),
             ]);
+        if (selected.includes('Webhook') && this.webhookConfigured())
+            jobs.push(['Webhook', () => this.sendWebhooks(req)]);
         if (selected.includes('ntfy') && this.ntfyConfigured())
             jobs.push(['ntfy', () => this.sendNtfy(req)]);
         if (selected.includes('Pushover') && this.pushoverConfigured())
@@ -4302,18 +5327,57 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         }));
         return result;
     }
-    /** Pushes a notification through Home Assistant's notify service (phone Companion app). */
-    async sendHomeAssistantNotification(title, message, cameraEntity, tag, objects, faces) {
+    /** Requirement 11: Sends to both Home Assistant Persistent Notification (sidebar bell) and Mobile Companion App(s). */
+    async sendHomeAssistantNotification(title, message, cameraEntity, haImageUrl, tag) {
         const v = this.storageSettings.values;
-        const base = String(v.haUrl ?? '').trim().replace(/\/+$/, '');
-        const token = String(v.haToken ?? '').trim();
-        const services = String(v.haNotifyServices ?? '')
+        const base = String(v.haUrl ?? '').trim().replace(/\/+$/, '') ||
+            (process.env.SUPERVISOR_TOKEN ? 'http://supervisor/core' : '');
+        const token = String(v.haToken ?? '').trim() || process.env.SUPERVISOR_TOKEN || '';
+        const rawServices = String(v.haNotifyServices ?? '')
             .split(',')
             .map(x => x.trim().replace(/^notify\./, ''))
             .filter(Boolean);
-        if (!base || !token || !services.length)
+        const wantPersistent = Boolean(v.haPersistentNotification ?? true) ||
+            rawServices.some(s => s === 'persistent_notification' || s === 'persistent_notification.create');
+        let services = rawServices.filter(s => s !== 'persistent_notification' && s !== 'persistent_notification.create');
+        if (!base || !token)
             return false;
-        // Keys for both Android and iOS Companion apps; each app ignores the other's.
+        // Auto-discover all mobile_app_* notify services from Home Assistant if none were manually entered
+        if (!services.length) {
+            try {
+                const res = await fetch(`${base}/api/services`, {
+                    headers: { authorization: `Bearer ${token}` },
+                    signal: AbortSignal.timeout(8000),
+                });
+                if (res.ok) {
+                    const domains = await res.json();
+                    if (Array.isArray(domains)) {
+                        const notifyDomain = domains.find((d) => d?.domain === 'notify');
+                        if (notifyDomain?.services && typeof notifyDomain.services === 'object') {
+                            services = Object.keys(notifyDomain.services).filter(k => k.startsWith('mobile_app_'));
+                        }
+                    }
+                }
+            }
+            catch {
+                // ignore auto-discovery error; persistent_notification still runs
+            }
+        }
+        const errors = [];
+        // 1. Home Assistant Persistent Notification (sidebar bell)
+        if (wantPersistent) {
+            try {
+                await postJson(`${base}/api/services/persistent_notification/create`, { authorization: `Bearer ${token}` }, {
+                    title,
+                    message,
+                    notification_id: tag || `ai-alert-${Date.now()}`,
+                }, 15000);
+            }
+            catch (e) {
+                errors.push(`persistent_notification: ${errMsg(e)}`);
+            }
+        }
+        // 2. Home Assistant Mobile App / Notify services
         const data = {
             channel: 'AI Vision Alerts',
             importance: 'high',
@@ -4322,26 +5386,95 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         };
         if (tag)
             data.tag = tag;
-        if (objects?.length)
-            data.objects = objects;
-        if (faces?.length)
-            data.faces = faces;
         if (cameraEntity) {
             data.image = `/api/camera_proxy/${cameraEntity}`; // Android
             data.entity_id = cameraEntity; // iOS
         }
-        const errors = [];
+        else if (haImageUrl && haImageUrl.startsWith('/local/')) {
+            data.image = haImageUrl;
+        }
         for (const service of services) {
             try {
                 await postJson(`${base}/api/services/notify/${service}`, { authorization: `Bearer ${token}` }, { title, message, data }, 15000);
             }
             catch (e) {
-                errors.push(`${service}: ${errMsg(e)}`);
+                try {
+                    await postJson(`${base}/api/services/notify/${service}`, { authorization: `Bearer ${token}` }, { title, message }, 15000);
+                }
+                catch {
+                    errors.push(`${service}: ${errMsg(e)}`);
+                }
             }
         }
         if (errors.length)
             throw new Error(errors.join('; '));
         return true;
+    }
+    /** Requirement 12: Sends rich JSON webhooks for Tesla car alerts, Android/Fire TV video/image popups, Home Assistant, etc. */
+    async sendWebhooks(req) {
+        const v = this.storageSettings.values;
+        const urls = String(v.webhookUrls ?? '')
+            .split(/[\r\n,]+/)
+            .map(u => u.trim())
+            .filter(Boolean);
+        if (!urls.length)
+            return;
+        const token = String(v.webhookToken ?? '').trim();
+        const includeImage = Boolean(v.webhookIncludeImage ?? true);
+        const streamUrl = String(v.webhookVideoStreamUrl ?? '').trim() || undefined;
+        const b64 = includeImage && req.jpeg ? req.jpeg.toString('base64') : undefined;
+        const headers = {};
+        if (token) {
+            headers.authorization = `Bearer ${token}`;
+            headers['x-webhook-secret'] = token;
+        }
+        // Payload compatible with Home Assistant webhooks, Tesla integrations, and Android/Fire TV (Pipup) overlays
+        const payload = {
+            source: 'scrypted-ai-vision-alerts',
+            title: req.title,
+            message: req.message,
+            summary: req.rawSummary ?? req.message,
+            timestamp: req.timestampText,
+            isoTimestamp: req.isoTimestamp,
+            cameraId: req.cameraId,
+            cameraName: req.cameraName,
+            severity: req.severity,
+            objects: req.objects ?? [],
+            faces: req.faces ?? [],
+            recognizedFaces: (req.faces ?? []).filter(f => f !== 'unknown'),
+            unknownFacesCount: req.unknownFacesCount ?? 0,
+            licensePlates: req.licensePlates ?? [],
+            vehicles: req.vehicles ?? [],
+            deliveryCarrier: req.deliveryCarrier ?? null,
+            carriedItems: req.carriedItems ?? [],
+            savedSnapshotPath: req.savedSnapshotPath ?? null,
+            haImageUrl: req.haImageUrl ?? null,
+            videoStreamUrl: streamUrl ?? null,
+            imageBase64: b64 ?? null,
+            imageDataUrl: b64 ? `data:image/jpeg;base64,${b64}` : null,
+            // Android TV / Fire TV (Pipup) overlay fields
+            duration: 12,
+            position: 0,
+            titleSize: 20,
+            messageSize: 14,
+            backgroundColor: '#cc000000',
+            media: streamUrl
+                ? { web: { uri: streamUrl, width: 640, height: 360 } }
+                : b64
+                    ? { image: { uri: `data:image/jpeg;base64,${b64}`, width: 640 } }
+                    : undefined,
+        };
+        const errors = [];
+        for (const url of urls) {
+            try {
+                await postJson(url, headers, payload, 15000);
+            }
+            catch (e) {
+                errors.push(`${url}: ${errMsg(e)}`);
+            }
+        }
+        if (errors.length)
+            throw new Error(errors.join('; '));
     }
     async sendNtfy(req) {
         const v = this.storageSettings.values;
@@ -4352,7 +5485,6 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
         if (v.ntfyToken)
             auth.authorization = `Bearer ${String(v.ntfyToken).trim()}`;
         if (req.jpeg) {
-            // Publishing a file: the message travels in headers.
             await fetchOk(`${base}/${encodeURIComponent(topic)}`, {
                 method: 'PUT',
                 headers: {
@@ -4411,7 +5543,7 @@ class AIAlertsPlugin extends srcExports.ScryptedDeviceBase {
             }
         }
         catch (e) {
-            throw new Error(errMsg(e).split(token).join('***')); // never leak the bot token into logs
+            throw new Error(errMsg(e).split(token).join('***'));
         }
     }
     /* ---------------- Mixin registration ---------------- */
